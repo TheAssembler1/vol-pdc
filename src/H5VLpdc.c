@@ -1579,8 +1579,8 @@ _add_xfer_request(H5VL_pdc_obj_t *file, pdcid_t transfer_request, void *buf)
         file->bufs          = (void **)realloc(file->bufs, file->req_alloc * sizeof(void *));
     }
 
-    file->xfer_requests[file->req_cnt + 1] = transfer_request;
-    file->bufs[file->req_cnt + 1]          = buf;
+    file->xfer_requests[file->req_cnt] = transfer_request;
+    file->bufs[file->req_cnt]          = buf;
     file->req_cnt++;
 
     return SUCCEED;
