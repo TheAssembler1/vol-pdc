@@ -921,6 +921,55 @@ done:
     FUNC_LEAVE_VOL
 } /* end H5VL__pdc_dset_init() */
 
+/* Integers map to the PDC type of the same width and signedness. The original
+ * mapping sent every integer to PDC_INT (4 bytes), so 1-, 2- and 8-byte integer
+ * datasets moved the wrong number of bytes. */
+static pdc_var_type_t
+_h5_int_to_pdc(hid_t type_id)
+{
+    int    is_signed = H5Tget_sign(type_id) != H5T_SGN_NONE;
+    size_t size      = H5Tget_size(type_id);
+    switch (size) {
+        case 1:
+            return is_signed ? PDC_INT8 : PDC_UINT8;
+        case 2:
+            return is_signed ? PDC_INT16 : PDC_UINT16;
+        case 8:
+            return is_signed ? PDC_INT64 : PDC_UINT64;
+        default:
+            return is_signed ? PDC_INT : PDC_UINT;
+    }
+}
+
+static int
+_pdc_is_int(pdc_var_type_t t)
+{
+    return t == PDC_INT || t == PDC_UINT || t == PDC_INT8 || t == PDC_UINT8 || t == PDC_INT16 ||
+           t == PDC_UINT16 || t == PDC_INT32 || t == PDC_INT64 || t == PDC_UINT64;
+}
+
+/* HDF5 datatype for a PDC object type (H5Dget_type on reopened datasets) */
+static hid_t
+_pdc_to_h5_type(pdc_var_type_t t)
+{
+    switch (t) {
+        case PDC_INT8: return H5Tcopy(H5T_NATIVE_INT8);
+        case PDC_UINT8: return H5Tcopy(H5T_NATIVE_UINT8);
+        case PDC_INT16: return H5Tcopy(H5T_NATIVE_INT16);
+        case PDC_UINT16: return H5Tcopy(H5T_NATIVE_UINT16);
+        case PDC_INT:
+        case PDC_INT32: return H5Tcopy(H5T_NATIVE_INT32);
+        case PDC_UINT: return H5Tcopy(H5T_NATIVE_UINT32);
+        case PDC_INT64: return H5Tcopy(H5T_NATIVE_INT64);
+        case PDC_UINT64: return H5Tcopy(H5T_NATIVE_UINT64);
+        case PDC_FLOAT: return H5Tcopy(H5T_NATIVE_FLOAT);
+        case PDC_DOUBLE: return H5Tcopy(H5T_NATIVE_DOUBLE);
+        case PDC_CHAR:
+        case PDC_STRING: return H5Tcopy(H5T_NATIVE_CHAR);
+        default: return H5Tcopy(H5T_NATIVE_UINT8);
+    }
+}
+
 /*---------------------------------------------------------------------------*/
 static herr_t
 H5VL__pdc_dset_free(H5VL_pdc_obj_t *dset)
@@ -1315,9 +1364,8 @@ H5VL_pdc_dataset_create(void *obj, const H5VL_loc_params_t *loc_params, const ch
     dclass = H5Tget_class(type_id);
     switch (dclass) {
         case H5T_INTEGER:
-            /* printf("Datatype class: Integer\n"); */
-            PDCprop_set_obj_type(obj_prop, PDC_INT);
-            dset->pdc_type = PDC_INT;
+            dset->pdc_type = _h5_int_to_pdc(type_id);
+            PDCprop_set_obj_type(obj_prop, dset->pdc_type);
             break;
         case H5T_FLOAT:
             /* printf("Datatype class: Float\n"); */
@@ -1343,9 +1391,8 @@ H5VL_pdc_dataset_create(void *obj, const H5VL_loc_params_t *loc_params, const ch
             printf("Datatype class: Array is not supported in PDC\n");
             break;
         case H5T_ENUM:
-            /* printf("Datatype class: Enum\n"); */
-            PDCprop_set_obj_type(obj_prop, PDC_INT);
-            dset->pdc_type = PDC_INT;
+            dset->pdc_type = _h5_int_to_pdc(type_id);
+            PDCprop_set_obj_type(obj_prop, dset->pdc_type);
             break;
         case H5T_REFERENCE:
             printf("Datatype class: Reference is not supported in PDC\n");
@@ -1495,6 +1542,8 @@ H5VL_pdc_dataset_open(void *obj, const H5VL_loc_params_t *loc_params, const char
     }
 
     dset->space_id = H5Screate_simple(obj_info->obj_pt->ndim, obj_info->obj_pt->dims, NULL);
+    if (dset->type_id <= 0)
+        dset->type_id = _pdc_to_h5_type(dset->pdc_type);
     o->nobj++;
     H5_LIST_INSERT_HEAD(&o->ids, dset, entry);
 
@@ -1511,7 +1560,7 @@ _check_mem_type_id(H5T_class_t h5_dclass, pdc_var_type_t pdc_dtype)
     int is_match = 0;
     switch (h5_dclass) {
         case H5T_INTEGER:
-            if (pdc_dtype == PDC_INT)
+            if (_pdc_is_int(pdc_dtype))
                 is_match = 1;
             break;
         case H5T_FLOAT:
@@ -1531,7 +1580,7 @@ _check_mem_type_id(H5T_class_t h5_dclass, pdc_var_type_t pdc_dtype)
             printf("Datatype class: Array is not supported in PDC\n");
             break;
         case H5T_ENUM:
-            if (pdc_dtype == PDC_INT)
+            if (_pdc_is_int(pdc_dtype))
                 is_match = 1;
             break;
         case H5T_REFERENCE:
