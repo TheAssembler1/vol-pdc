@@ -850,6 +850,8 @@ done:
 } /* end H5VL__pdc_file_init() */
 
 /*---------------------------------------------------------------------------*/
+static herr_t _flush_xfer_requests(H5VL_pdc_obj_t *file);
+
 static herr_t
 H5VL__pdc_file_close(H5VL_pdc_obj_t *file)
 {
@@ -863,27 +865,12 @@ H5VL__pdc_file_close(H5VL_pdc_obj_t *file)
     assert(file);
 
     // Complete existing write requests
-    if (file->req_cnt > 0) {
-
-        ret = PDCregion_transfer_start_all(file->xfer_requests, file->req_cnt);
-        if (ret != SUCCEED)
-            HGOTO_ERROR(H5E_DATASET, H5E_WRITEERROR, FAIL, "Failed to region transfer start");
-
-        ret = PDCregion_transfer_wait_all(file->xfer_requests, file->req_cnt);
-        if (ret != SUCCEED)
-            HGOTO_ERROR(H5E_DATASET, H5E_WRITEERROR, FAIL, "Failed to region transfer wait");
-
-        for (int i = 0; i < file->req_cnt; i++) {
-            ret = PDCregion_transfer_close(file->xfer_requests[i]);
-            if (ret != SUCCEED)
-                HGOTO_ERROR(H5E_DATASET, H5E_CLOSEERROR, FAIL, "Failed to region transfer close");
-            if (file->bufs[i] != NULL) {
-                free(file->bufs[i]);
-                file->bufs[i] = NULL;
-            }
-        }
-        file->req_cnt = 0;
+    ret = _flush_xfer_requests(file);
+    if (ret != SUCCEED)
+        HGOTO_ERROR(H5E_DATASET, H5E_WRITEERROR, FAIL, "Failed to complete deferred writes");
+    if (file->req_alloc) {
         free(file->xfer_requests);
+        free(file->bufs);
         file->req_alloc = 0;
     }
 
@@ -1200,7 +1187,12 @@ H5VL_pdc_file_specific(void *file, H5VL_file_specific_args_t *args, hid_t dxpl_i
         /* Set object pointer for operation */
         new_o = o->under_object;
     } /* end else */
-    if (args->op_type != H5VL_FILE_FLUSH) {
+    if (args->op_type == H5VL_FILE_FLUSH) {
+        /* the deferred write queue lives on the file object */
+        H5VL_pdc_obj_t *f = o ? o->file_obj_ptr : NULL;
+        ret_value = _flush_xfer_requests(f ? f : o) == SUCCEED ? 0 : -1;
+    }
+    else {
         ret_value = H5VLfile_specific(new_o, under_vol_id, new_args, dxpl_id, req);
     }
 
@@ -1586,6 +1578,33 @@ _add_xfer_request(H5VL_pdc_obj_t *file, pdcid_t transfer_request, void *buf)
     return SUCCEED;
 }
 
+/* Start, wait for and close every deferred write of this file and free the
+ * cached user buffers. Must run while the target PDC objects are still open. */
+static herr_t
+_flush_xfer_requests(H5VL_pdc_obj_t *file)
+{
+    herr_t ret_value = SUCCEED;
+
+    if (file == NULL || file->req_cnt <= 0)
+        return SUCCEED;
+    if (PDCregion_transfer_start_all(file->xfer_requests, file->req_cnt) != SUCCEED)
+        ret_value = FAIL;
+    else if (PDCregion_transfer_wait_all(file->xfer_requests, file->req_cnt) != SUCCEED)
+        ret_value = FAIL;
+    for (int i = 0; i < file->req_cnt; i++) {
+        if (PDCregion_transfer_close(file->xfer_requests[i]) != SUCCEED)
+            ret_value = FAIL;
+        file->xfer_requests[i] = 0;
+        if (file->bufs[i] != NULL) {
+            free(file->bufs[i]);
+            file->bufs[i] = NULL;
+        }
+    }
+    file->req_cnt      = 0;
+    write_cache_size_g = 0;
+    return ret_value;
+}
+
 /*---------------------------------------------------------------------------*/
 herr_t
 H5VL_pdc_dataset_write(size_t count, void *_dset[], hid_t mem_type_id[], hid_t mem_space_id[],
@@ -1677,27 +1696,15 @@ H5VL_pdc_dataset_write(size_t count, void *_dset[], hid_t mem_type_id[], hid_t m
 
             _add_xfer_request(file, transfer_request, NULL);
 
-            ret = PDCregion_transfer_start_all(file->xfer_requests, file->req_cnt);
+            ret = _flush_xfer_requests(file);
             if (ret != SUCCEED)
-                HGOTO_ERROR(H5E_DATASET, H5E_WRITEERROR, FAIL, "Failed to region transfer start");
-
-            ret = PDCregion_transfer_wait_all(file->xfer_requests, file->req_cnt);
-            if (ret != SUCCEED)
-                HGOTO_ERROR(H5E_DATASET, H5E_WRITEERROR, FAIL, "Failed to region transfer wait");
-
-            for (int i = 0; i < file->req_cnt; i++) {
-                ret = PDCregion_transfer_close(file->xfer_requests[i]);
-                if (ret != SUCCEED)
-                    HGOTO_ERROR(H5E_DATASET, H5E_CLOSEERROR, FAIL, "Failed to region transfer close");
-                file->xfer_requests[i] = 0;
-            }
-            file->req_cnt      = 0;
-            write_cache_size_g = 0;
+                HGOTO_ERROR(H5E_DATASET, H5E_WRITEERROR, FAIL, "Failed to complete deferred writes");
         }
         else {
             // Cache the user buffer
             cache_buf = malloc(total_size);
             memcpy(cache_buf, buf[u], total_size);
+            write_cache_size_g += total_size;
 
             transfer_request =
                 PDCregion_transfer_create(cache_buf, PDC_WRITE, dset->obj_id, region_local, region_remote);
@@ -1736,26 +1743,8 @@ H5VL_pdc_dataset_read(size_t count, void *_dset[], hid_t mem_type_id[], hid_t me
     // Complete existing write requests
     dset = (H5VL_pdc_obj_t *)_dset[0];
     file = dset->file_obj_ptr;
-    if (file->req_cnt > 0) {
-        ret = PDCregion_transfer_start_all(file->xfer_requests, file->req_cnt);
-        if (ret != SUCCEED)
-            HGOTO_ERROR(H5E_DATASET, H5E_WRITEERROR, FAIL, "Failed to region transfer start");
-
-        ret = PDCregion_transfer_wait_all(file->xfer_requests, file->req_cnt);
-        if (ret != SUCCEED) {
-            HGOTO_ERROR(H5E_DATASET, H5E_WRITEERROR, FAIL, "Failed to region transfer wait");
-        }
-        for (i = 0; i < file->req_cnt; i++) {
-            ret = PDCregion_transfer_close(file->xfer_requests[i]);
-            if (ret != SUCCEED)
-                HGOTO_ERROR(H5E_DATASET, H5E_CLOSEERROR, FAIL, "Failed to region transfer close");
-            if (file->bufs[i] != NULL) {
-                free(file->bufs[i]);
-                file->bufs[i] = NULL;
-            }
-        }
-        file->req_cnt = 0;
-    }
+    if (_flush_xfer_requests(file) != SUCCEED)
+        HGOTO_ERROR(H5E_DATASET, H5E_WRITEERROR, FAIL, "Failed to complete deferred writes");
 
     for (size_t u = 0; u < count; u++) {
         dset = (H5VL_pdc_obj_t *)_dset[u];
@@ -1886,6 +1875,8 @@ H5VL_pdc_dataset_close(void *_dset, hid_t dxpl_id __attribute__((unused)), void 
     FUNC_ENTER_VOL(herr_t, SUCCEED)
 
     assert(dset);
+    if (_flush_xfer_requests(dset->file_obj_ptr) != SUCCEED)
+        HGOTO_ERROR(H5E_DATASET, H5E_WRITEERROR, FAIL, "Failed to complete deferred writes");
     if ((ret = PDCobj_close(dset->obj_id)) < 0)
         HGOTO_ERROR(H5E_DATASET, H5E_CLOSEERROR, FAIL, "can't close object");
     if (dset->reg_id_from != 0) {
