@@ -20,6 +20,7 @@
 
 #include "hdf5.h"
 #include "H5PLextern.h"
+#include "H5Ldevelop.h"
 #include "H5VLerror.h"
 
 /* External headers needed by this file */
@@ -1015,14 +1016,20 @@ _pdc_to_h5_type(pdc_var_type_t t)
  *   attribute -> PDC tag on the object or container, described by an index tag
  *                (see H5VL_PDC_ATTR_INDEX)
  *
+ *   soft or external link -> an empty container whose H5VL_PDC_LINK_TAG tag holds the
+ *                target. Lookups follow it; a dangling link only fails when followed.
+ *
  * Link creation order is the order of the container's entries. Lookups are
  * independent, because HDF5 and CGNS may read metadata on a subset of ranks (CGNS
  * opens a file on rank 0 alone to detect its type). Changes are collective: rank 0
  * makes them and the others wait for its status.
  */
 #define H5VL_PDC_ATTR_INDEX "__h5vol_attr_index"
+#define H5VL_PDC_LINK_TAG   "__h5vol_link"
+#define H5VL_PDC_MAX_LINKS  16 /* depth of links followed, which also stops loops */
 
 typedef struct _pdc_loc_t {
+    H5VL_pdc_obj_t *  file; /* holds a reference; a link can lead to another file */
     pdc_entity_type_t type;
     uint64_t          meta_id;
     char *            path;     /* path inside the file */
@@ -1039,6 +1046,11 @@ static herr_t H5VL__pdc_file_close(H5VL_pdc_obj_t *file);
 typedef struct _name_slot_t {
     uint64_t id;
     char *   name;
+    /* Whether the id is a link, also fixed for its lifetime */
+    int        link_known;
+    H5L_type_t link_type;
+    char *     link_path;
+    char *     link_file;
 } _name_slot_t;
 
 static _name_slot_t *name_cache_g      = NULL;
@@ -1076,6 +1088,7 @@ _name_cache_insert(uint64_t id, char *name)
     i = _name_hash(id) & (name_cache_cap_g - 1);
     while (name_cache_g[i].id)
         i = (i + 1) & (name_cache_cap_g - 1);
+    memset(&name_cache_g[i], 0, sizeof(name_cache_g[i]));
     name_cache_g[i].id   = id;
     name_cache_g[i].name = name;
     name_cache_used_g++;
@@ -1105,13 +1118,19 @@ _entry_name(uint64_t id)
 static void
 _name_cache_free(void)
 {
-    for (size_t k = 0; k < name_cache_cap_g; k++)
+    for (size_t k = 0; k < name_cache_cap_g; k++) {
         free(name_cache_g[k].name);
+        free(name_cache_g[k].link_path);
+        free(name_cache_g[k].link_file);
+    }
     free(name_cache_g);
     name_cache_g      = NULL;
     name_cache_cap_g  = 0;
     name_cache_used_g = 0;
 }
+
+static H5VL_pdc_obj_t *H5VL__pdc_file_init(const char *name, unsigned flags, H5VL_pdc_info_t *info,
+                                           hid_t fapl_id);
 
 static H5VL_pdc_obj_t *
 _file_of(H5VL_pdc_obj_t *o)
@@ -1193,6 +1212,9 @@ _loc_free(_pdc_loc_t *loc)
     free(loc->path);
     free(loc->pdc_name);
     loc->path = loc->pdc_name = NULL;
+    if (loc->file)
+        H5VL__pdc_file_close(loc->file);
+    loc->file = NULL;
 }
 
 /* 0 found, 1 not found, -1 error. cont is a local handle or a meta id. */
@@ -1227,36 +1249,117 @@ _find_child(pdcid_t cont, const char *leaf, uint64_t *meta_id, pdc_entity_type_t
     return ret;
 }
 
-/* Follow name from object o. 0 found, 1 not found, -1 error. */
+/* The target of a link container: 1 yes, 0 not a link. Strings are owned by the cache. */
 static int
-_resolve(H5VL_pdc_obj_t *o, const char *name, _pdc_loc_t *loc)
+_entry_link(uint64_t id, H5L_type_t *type, const char **path, const char **file)
 {
-    H5VL_pdc_obj_t *file = _file_of(o);
-    int             ret  = 0;
-    char *          copy, *comp, *save = NULL;
+    _name_slot_t *slot = NULL;
+    void *        tag = NULL;
+    psize_t       size = 0;
+    pdc_var_type_t tag_type;
+    pdcid_t       h;
+
+    if (_entry_name(id) == NULL)
+        return 0;
+    for (size_t i = _name_hash(id) & (name_cache_cap_g - 1); name_cache_g[i].id; i = (i + 1) & (name_cache_cap_g - 1)) {
+        if (name_cache_g[i].id == id) {
+            slot = &name_cache_g[i];
+            break;
+        }
+    }
+    if (slot == NULL)
+        return 0;
+    if (!slot->link_known) {
+        if ((h = PDCcont_open_id((pdcid_t)id, pdc_id_g)) == 0)
+            return 0;
+        if (PDCcont_get_tag(h, H5VL_PDC_LINK_TAG, &tag, &tag_type, &size) == SUCCEED && tag && size > 1) {
+            /* type byte, path, NUL, file, NUL */
+            const char *blob = (const char *)tag;
+            slot->link_type = blob[0] == 'E' ? H5L_TYPE_EXTERNAL : H5L_TYPE_SOFT;
+            slot->link_path = strdup(blob + 1);
+            slot->link_file = strdup(blob + 2 + strlen(blob + 1));
+        }
+        free(tag);
+        PDCcont_close(h);
+        slot->link_known = 1;
+    }
+    if (slot->link_path == NULL)
+        return 0;
+    if (type)
+        *type = slot->link_type;
+    if (path)
+        *path = slot->link_path;
+    if (file)
+        *file = slot->link_file;
+    return 1;
+}
+
+/* A file reached through an external link, open only for the objects inside it.
+ * The target is relative to the directory of the linking file. Returns with one
+ * reference held by the caller. Such a file is read-only and independent. */
+static H5VL_pdc_obj_t *
+_open_external(H5VL_pdc_obj_t *from, const char *target)
+{
+    H5VL_pdc_obj_t *file;
+    const char *    slash = strrchr(from->file_name, '/');
+    size_t          dir   = slash ? (size_t)(slash - from->file_name) + 1 : 0;
+    char *          name;
+    pdcid_t         cont;
+
+    while (target[0] == '.' && target[1] == '/')
+        target += 2;
+    if (target[0] == '/')
+        dir = 0;
+    name = (char *)malloc(dir + strlen(target) + 1);
+    memcpy(name, from->file_name, dir);
+    strcpy(name + dir, target);
+    cont = PDCcont_open(name, pdc_id_g);
+    if (cont == 0) {
+        free(name);
+        return NULL;
+    }
+    file = H5VL__pdc_file_init(name, H5F_ACC_RDONLY, NULL, H5P_FILE_ACCESS_DEFAULT);
+    if (file) {
+        file->cont_id = cont;
+        file->meta_id = PDCcont_get_info(name)->meta_id;
+        file->fcpl_id = H5Pcreate(H5P_FILE_CREATE);
+    }
+    free(name);
+    return file;
+}
+
+/* Follow name from a starting location. 0 found, 1 not found, -1 error. follow_last
+ * says whether to go through a link at the end of the path: H5Lexists and link
+ * queries are about the link itself, opens are about its target. */
+static int
+_resolve_from(H5VL_pdc_obj_t *file, pdc_entity_type_t type, uint64_t meta_id, const char *path,
+              const char *pdc_name, const char *name, int follow_last, int depth, _pdc_loc_t *loc)
+{
+    int   ret = 0;
+    char *copy, *comp, *next, *save = NULL;
 
     memset(loc, 0, sizeof(*loc));
-    if (name[0] == '/') {
-        loc->type    = PDC_ENTITY_CONT;
-        loc->meta_id = file->meta_id;
-        loc->path    = strdup("/");
-    }
-    else {
-        loc->type    = o->h5i_type == H5I_DATASET ? PDC_ENTITY_OBJ : PDC_ENTITY_CONT;
-        loc->meta_id = o->meta_id;
-        loc->path    = strdup(o->path ? o->path : "/");
-        if (o->h5i_type == H5I_DATASET)
-            loc->pdc_name = strdup(o->pdc_name);
-    }
+    file->refcnt++;
+    loc->file     = file;
+    loc->type     = type;
+    loc->meta_id  = meta_id;
+    loc->path     = strdup(path);
+    loc->pdc_name = pdc_name ? strdup(pdc_name) : NULL;
 
     copy = strdup(name);
-    for (comp = strtok_r(copy, "/", &save); comp && ret == 0; comp = strtok_r(NULL, "/", &save)) {
-        char *            child_name = NULL, *child_path;
+    comp = strtok_r(copy, "/", &save);
+    while (comp && strcmp(comp, ".") == 0)
+        comp = strtok_r(NULL, "/", &save);
+    for (; comp && ret == 0; comp = next) {
+        char *            child_name = NULL;
         uint64_t          child_id;
         pdc_entity_type_t child_type;
+        H5L_type_t        link_type;
+        const char *      link_path, *link_file;
 
-        if (strcmp(comp, ".") == 0)
-            continue;
+        next = strtok_r(NULL, "/", &save);
+        while (next && strcmp(next, ".") == 0)
+            next = strtok_r(NULL, "/", &save);
         if (loc->type != PDC_ENTITY_CONT) {
             ret = 1;
             break;
@@ -1264,17 +1367,65 @@ _resolve(H5VL_pdc_obj_t *o, const char *name, _pdc_loc_t *loc)
         ret = _find_child((pdcid_t)loc->meta_id, comp, &child_id, &child_type, &child_name, NULL);
         if (ret != 0)
             break;
-        child_path = _path_join(loc->path, comp);
-        _loc_free(loc);
-        loc->meta_id  = child_id;
-        loc->type     = child_type;
-        loc->path     = child_path;
-        loc->pdc_name = child_name;
+        if (child_type == PDC_ENTITY_CONT && (next || follow_last) &&
+            _entry_link(child_id, &link_type, &link_path, &link_file)) {
+            H5VL_pdc_obj_t *target = loc->file;
+            _pdc_loc_t      sub;
+
+            free(child_name);
+            if (depth >= H5VL_PDC_MAX_LINKS) {
+                ret = 1;
+                break;
+            }
+            if (link_type == H5L_TYPE_EXTERNAL && NULL == (target = _open_external(loc->file, link_file))) {
+                ret = 1;
+                break;
+            }
+            if (link_type == H5L_TYPE_SOFT && link_path[0] != '/')
+                ret = _resolve_from(target, PDC_ENTITY_CONT, loc->meta_id, loc->path, NULL, link_path, 1,
+                                    depth + 1, &sub);
+            else
+                ret = _resolve_from(target, PDC_ENTITY_CONT, target->meta_id, "/", NULL, link_path, 1, depth + 1,
+                                    &sub);
+            if (link_type == H5L_TYPE_EXTERNAL)
+                H5VL__pdc_file_close(target); /* sub holds its own reference */
+            _loc_free(loc);
+            *loc = sub;
+        }
+        else {
+            char *child_path = _path_join(loc->path, comp);
+            H5VL_pdc_obj_t *f = loc->file;
+            f->refcnt++;
+            _loc_free(loc);
+            loc->file     = f;
+            loc->meta_id  = child_id;
+            loc->type     = child_type;
+            loc->path     = child_path;
+            loc->pdc_name = child_name;
+        }
     }
     free(copy);
     if (ret != 0)
         _loc_free(loc);
     return ret;
+}
+
+static int
+_resolve_o(H5VL_pdc_obj_t *o, const char *name, int follow_last, _pdc_loc_t *loc)
+{
+    H5VL_pdc_obj_t *file = _file_of(o);
+
+    if (name[0] == '/')
+        return _resolve_from(file, PDC_ENTITY_CONT, file->meta_id, "/", NULL, name, follow_last, 0, loc);
+    return _resolve_from(file, o->h5i_type == H5I_DATASET ? PDC_ENTITY_OBJ : PDC_ENTITY_CONT, o->meta_id,
+                         o->path ? o->path : "/", o->h5i_type == H5I_DATASET ? o->pdc_name : NULL, name,
+                         follow_last, 0, loc);
+}
+
+static int
+_resolve(H5VL_pdc_obj_t *o, const char *name, _pdc_loc_t *loc)
+{
+    return _resolve_o(o, name, 1, loc);
 }
 
 /* Split "a/b/c" into parent "a/b" and leaf "c". parent is "." when name has one component. */
@@ -1407,7 +1558,7 @@ _loc_owner(H5VL_pdc_obj_t *o, const H5VL_loc_params_t *loc_params, H5VL_pdc_obj_
         return o;
     if (_resolve(o, loc_params->loc_data.loc_by_name.name, &loc) != 0)
         return NULL;
-    res = _open_loc(_file_of(o), &loc);
+    res = _open_loc(loc.file, &loc);
     _loc_free(&loc);
     *tmp = res;
     return res;
@@ -2035,6 +2186,7 @@ H5VL_pdc_dataset_create(void *obj, const H5VL_loc_params_t *loc_params, const ch
     if (_resolve(o, parent_name, &parent_loc) != 0 || parent_loc.type != PDC_ENTITY_CONT)
         HGOTO_ERROR(H5E_DATASET, H5E_CANTCREATE, NULL, "parent group does not exist");
     have_parent = 1;
+    file        = parent_loc.file;
     _change_begin(file);
     {
         herr_t status = 0;
@@ -2207,7 +2359,7 @@ H5VL_pdc_dataset_open(void *obj, const H5VL_loc_params_t *loc_params __attribute
     if (_resolve(o, _name, &loc) != 0)
         return NULL;
     if (loc.type == PDC_ENTITY_OBJ)
-        dset = _open_dset_obj(_file_of(o), &loc);
+        dset = _open_dset_obj(loc.file, &loc);
     _loc_free(&loc);
     return dset;
 } /* end H5VL_pdc_dataset_open() */
@@ -2801,6 +2953,7 @@ H5VL_pdc_group_create(void *obj, const H5VL_loc_params_t *loc_params __attribute
     }
     if (parent_loc.type != PDC_ENTITY_CONT)
         goto done;
+    file = parent_loc.file;
     _change_begin(file);
     {
         herr_t status = 0;
@@ -2849,7 +3002,7 @@ H5VL_pdc_group_open(void *obj, const H5VL_loc_params_t *loc_params __attribute__
     if (_resolve(o, name, &loc) != 0)
         return NULL;
     if (loc.type == PDC_ENTITY_CONT)
-        group = _open_group_obj(_file_of(o), loc.meta_id, loc.path, 0);
+        group = _open_group_obj(loc.file, loc.meta_id, loc.path, 0);
     _loc_free(&loc);
     return (void *)group;
 } /* end H5VL_pdc_group_open() */
@@ -2937,14 +3090,79 @@ H5VL_pdc_group_close(void *grp, hid_t dxpl_id __attribute__((unused)), void **re
 
 /*---------------------------------------------------------------------------*/
 static herr_t
-H5VL_pdc_link_create(H5VL_link_create_args_t *args __attribute__((unused)), void *obj __attribute__((unused)),
-                     const H5VL_loc_params_t *loc_params __attribute__((unused)),
+H5VL_pdc_link_create(H5VL_link_create_args_t *args, void *obj, const H5VL_loc_params_t *loc_params,
                      hid_t lcpl_id __attribute__((unused)), hid_t lapl_id __attribute__((unused)),
                      hid_t dxpl_id __attribute__((unused)), void **req __attribute__((unused)))
 {
-    /* Hard, soft and external links are not supported. Report it rather than
-     * returning success for a link that was never made. */
-    return -1;
+    H5VL_pdc_obj_t *o    = (H5VL_pdc_obj_t *)obj;
+    H5VL_pdc_obj_t *file = _file_of(o);
+    const char *    target, *target_file = "";
+    char            kind;
+    char *          parent_name, *leaf, *blob;
+    size_t          blob_len;
+    _pdc_loc_t      parent_loc;
+    pdcid_t         parent, prop, child;
+    herr_t          status = 0;
+
+    if (loc_params->type != H5VL_OBJECT_BY_NAME)
+        return -1;
+    if (args->op_type == H5VL_LINK_CREATE_SOFT) {
+        kind   = 'S';
+        target = args->args.soft.target;
+    }
+    else if (args->op_type == H5VL_LINK_CREATE_UD && args->args.ud.type == H5L_TYPE_EXTERNAL) {
+        /* version and flags byte, file, NUL, path, NUL */
+        kind        = 'E';
+        target_file = (const char *)args->args.ud.buf + 1;
+        target      = target_file + strlen(target_file) + 1;
+    }
+    else {
+        return -1; /* hard links would need a second name for a container */
+    }
+
+    _split_name(loc_params->loc_data.loc_by_name.name, &parent_name, &leaf);
+    if (_resolve(o, parent_name, &parent_loc) != 0) {
+        free(parent_name);
+        free(leaf);
+        return -1;
+    }
+    _change_begin(file);
+    if (parent_loc.type != PDC_ENTITY_CONT ||
+        (_is_writer(file) && _find_child((pdcid_t)parent_loc.meta_id, leaf, NULL, NULL, NULL, NULL) != 1))
+        status = -1;
+    if (_sync_status(file, status) < 0) {
+        _loc_free(&parent_loc);
+        free(parent_name);
+        free(leaf);
+        return -1;
+    }
+
+    parent = parent_loc.meta_id == o->meta_id && o->h5i_type != H5I_DATASET
+                 ? o->cont_id
+                 : PDCcont_open_id((pdcid_t)parent_loc.meta_id, pdc_id_g);
+    prop   = PDCprop_create(PDC_CONT_CREATE, pdc_id_g);
+    child  = _is_coll(file) ? PDCcont_create_at_coll(parent, leaf, prop, file->comm)
+                            : PDCcont_create_at(parent, leaf, prop);
+    status = child ? 0 : -1;
+    if (child && _is_writer(file)) {
+        blob_len = 1 + strlen(target) + 1 + strlen(target_file) + 1;
+        blob     = (char *)malloc(blob_len);
+        blob[0]  = kind;
+        strcpy(blob + 1, target);
+        strcpy(blob + 2 + strlen(target), target_file);
+        status = PDCcont_put_tag(child, H5VL_PDC_LINK_TAG, blob, PDC_CHAR, blob_len) == SUCCEED ? 0 : -1;
+        free(blob);
+    }
+    status = _sync_status(file, status);
+    if (child)
+        PDCcont_close(child);
+    PDCprop_close(prop);
+    if (parent != o->cont_id)
+        PDCcont_close(parent);
+    _loc_free(&parent_loc);
+    free(parent_name);
+    free(leaf);
+    return status;
 } /* end H5VL_pdc_link_create() */
 
 /*---------------------------------------------------------------------------*/
@@ -2972,6 +3190,24 @@ H5VL_pdc_link_move(void *                   src_obj __attribute__((unused)),
 } /* end H5VL_pdc_link_move() */
 
 /*---------------------------------------------------------------------------*/
+/* Type, and token or value size, of a link */
+static void
+_fill_link_info(uint64_t id, H5L_info2_t *linfo)
+{
+    H5L_type_t  type;
+    const char *path, *file;
+
+    if (_entry_link(id, &type, &path, &file)) {
+        linfo->type = type;
+        linfo->u.val_size =
+            type == H5L_TYPE_SOFT ? strlen(path) + 1 : 1 + strlen(file) + 1 + strlen(path) + 1;
+    }
+    else {
+        linfo->type = H5L_TYPE_HARD;
+        _token_of(id, &linfo->u.token);
+    }
+}
+
 static herr_t
 H5VL_pdc_link_get(void *obj, const H5VL_loc_params_t *loc_params, H5VL_link_get_args_t *args,
                   hid_t dxpl_id __attribute__((unused)), void **req __attribute__((unused)))
@@ -2991,11 +3227,46 @@ H5VL_pdc_link_get(void *obj, const H5VL_loc_params_t *loc_params, H5VL_link_get_
             if (parent_loc.type == PDC_ENTITY_CONT &&
                 _find_child((pdcid_t)parent_loc.meta_id, leaf, &id, NULL, NULL, &position) == 0) {
                 memset(linfo, 0, sizeof(*linfo));
-                linfo->type        = H5L_TYPE_HARD;
                 linfo->corder_valid = TRUE;
-                linfo->corder      = (int64_t)position;
-                linfo->cset        = H5T_CSET_ASCII;
-                _token_of(id, &linfo->u.token);
+                linfo->corder       = (int64_t)position;
+                linfo->cset         = H5T_CSET_ASCII;
+                _fill_link_info(id, linfo);
+                ret = 0;
+            }
+            _loc_free(&parent_loc);
+        }
+        free(parent_name);
+        free(leaf);
+        return ret;
+    }
+    if (args->op_type == H5VL_LINK_GET_VAL && loc_params->type == H5VL_OBJECT_BY_NAME) {
+        char *      parent_name, *leaf;
+        _pdc_loc_t  parent_loc;
+        uint64_t    id;
+        herr_t      ret = -1;
+        H5L_type_t  type;
+        const char *path, *file;
+
+        _split_name(loc_params->loc_data.loc_by_name.name, &parent_name, &leaf);
+        if (_resolve(o, parent_name, &parent_loc) == 0) {
+            if (parent_loc.type == PDC_ENTITY_CONT &&
+                _find_child((pdcid_t)parent_loc.meta_id, leaf, &id, NULL, NULL, NULL) == 0 &&
+                _entry_link(id, &type, &path, &file)) {
+                size_t size = type == H5L_TYPE_SOFT ? strlen(path) + 1
+                                                    : 1 + strlen(file) + 1 + strlen(path) + 1;
+                char * val  = (char *)malloc(size);
+                if (type == H5L_TYPE_SOFT)
+                    strcpy(val, path);
+                else {
+                    /* the format H5Lunpack_elink_val reads */
+                    val[0] = (char)((H5L_EXT_VERSION << 4) | 0);
+                    strcpy(val + 1, file);
+                    strcpy(val + 2 + strlen(file), path);
+                }
+                if (args->args.get_val.buf && args->args.get_val.buf_size > 0)
+                    memcpy(args->args.get_val.buf, val,
+                           size < args->args.get_val.buf_size ? size : args->args.get_val.buf_size);
+                free(val);
                 ret = 0;
             }
             _loc_free(&parent_loc);
@@ -3062,11 +3333,10 @@ _link_iterate(H5VL_pdc_obj_t *owner, H5VL_link_iterate_args_t *it)
         H5L_info2_t  linfo;
 
         memset(&linfo, 0, sizeof(linfo));
-        linfo.type         = H5L_TYPE_HARD;
         linfo.corder_valid = TRUE;
         linfo.corder       = (int64_t)r->corder;
         linfo.cset         = H5T_CSET_ASCII;
-        _token_of(r->meta_id, &linfo.u.token);
+        _fill_link_info(r->meta_id, &linfo);
         ret = it->op(gid, r->name, &linfo, it->op_data);
         if (it->idx_p)
             *it->idx_p = k + 1;
@@ -3092,7 +3362,7 @@ H5VL_pdc_link_specific(void *obj, const H5VL_loc_params_t *loc_params, H5VL_link
             int        found;
             if (loc_params->type != H5VL_OBJECT_BY_NAME)
                 return -1;
-            found = _resolve(o, loc_params->loc_data.loc_by_name.name, &loc);
+            found = _resolve_o(o, loc_params->loc_data.loc_by_name.name, 0, &loc);
             if (found < 0)
                 return -1;
             if (found == 0)
@@ -3490,7 +3760,7 @@ H5VL_pdc_object_open(void *obj, const H5VL_loc_params_t *loc_params, H5I_type_t 
         return NULL;
     if (_resolve(o, loc_params->loc_data.loc_by_name.name, &loc) != 0)
         return NULL;
-    new_obj = _open_loc(_file_of(o), &loc);
+    new_obj = _open_loc(loc.file, &loc);
     if (new_obj)
         *opened_type = loc.type == PDC_ENTITY_CONT ? H5I_GROUP : H5I_DATASET;
     _loc_free(&loc);
