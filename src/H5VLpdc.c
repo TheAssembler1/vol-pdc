@@ -106,6 +106,19 @@ typedef struct H5VL_pdc_obj_t {
     hid_t   space_id;
     hbool_t mapped;
     H5_LIST_ENTRY(H5VL_pdc_obj_t) entry;
+    /* Hierarchy */
+    char *   path;     /* group/dataset: path inside the file */
+    char *   pdc_name; /* dataset: name of the PDC object */
+    uint64_t meta_id;  /* global id of the container or object */
+    /* File object elements */
+    unsigned flags;
+    hid_t    fapl_id;
+    hid_t    fcpl_id;
+    int      refcnt; /* open handle plus every open object of the file */
+    /* Attribute object elements */
+    hid_t                  attr_type;
+    hid_t                  attr_space;
+    struct H5VL_pdc_obj_t *attr_owner_tmp;
 } H5VL_pdc_obj_t;
 
 /* PDC-specific file access properties */
@@ -395,6 +408,7 @@ static hbool_t H5VL_pdc_init_g = FALSE;
 hid_t H5VL_ERR_STACK_g = H5I_INVALID_HID;
 hid_t H5VL_ERR_CLS_g   = H5I_INVALID_HID;
 
+static void    _name_cache_free(void);
 static pdcid_t pdc_id_g  = 0;
 static int     my_rank_g = 0;
 
@@ -488,6 +502,8 @@ H5VL_pdc_obj_term(void)
 
     if (!H5VL_pdc_init_g)
         HGOTO_DONE(SUCCEED);
+
+    _name_cache_free();
 
     if (pdc_id_g > 0 && PDCclose(pdc_id_g) < 0)
         HGOTO_ERROR(H5E_FILE, H5E_CANTCLOSEFILE, FAIL, "failed to close PDC");
@@ -786,7 +802,7 @@ H5VL_pdc_free_wrap_ctx(void *_wrap_ctx)
 
 /*---------------------------------------------------------------------------*/
 static H5VL_pdc_obj_t *
-H5VL__pdc_file_init(const char *name, unsigned flags __attribute__((unused)),
+H5VL__pdc_file_init(const char *name, unsigned flags,
                     H5VL_pdc_info_t *info __attribute__((unused)), hid_t fapl_id)
 {
 #ifdef ENABLE_LOGGING
@@ -814,12 +830,24 @@ H5VL__pdc_file_init(const char *name, unsigned flags __attribute__((unused)),
     /* file->h5o_type     = H5O_TYPE_FILE; */
     file->file_obj_ptr = file;
     file->req_cnt      = 0;
+    file->flags        = flags;
+    file->refcnt       = 1;
+    file->num_procs    = 1;
+    /* Copying an MPI-IO FAPL duplicates its communicator, which is collective, and a
+     * read-only file may be open on a subset of the ranks. */
+    file->fapl_id      = (flags & (H5F_ACC_RDWR | H5F_ACC_TRUNC | H5F_ACC_EXCL | H5F_ACC_CREAT))
+                             ? H5Pcopy(fapl_id)
+                             : H5Pcreate(H5P_FILE_ACCESS);
+    file->path         = strdup("/");
 
     if (NULL == (file->file_name = strdup(name)))
         HGOTO_ERROR(H5E_RESOURCE, H5E_CANTALLOC, NULL, "can't copy file name");
 
     driver = H5Pget_driver(fapl_id);
-    if (driver == H5FD_MPIO) {
+    /* H5Pget_fapl_mpio duplicates the communicator, which is collective, and a file
+     * may be opened read-only on a subset of the ranks (CGNS does this on rank 0 to
+     * detect the file type). Read-only files make no collective changes. */
+    if (driver == H5FD_MPIO && (flags & (H5F_ACC_RDWR | H5F_ACC_TRUNC | H5F_ACC_EXCL | H5F_ACC_CREAT))) {
 #ifdef ENABLE_LOGGING
         fprintf(stderr, "Rank %d: %s MPI-IO driver detected\n", my_rank_g, __func__);
 #endif
@@ -850,12 +878,9 @@ done:
 } /* end H5VL__pdc_file_init() */
 
 /*---------------------------------------------------------------------------*/
-static herr_t _flush_xfer_requests(H5VL_pdc_obj_t *file);
-
 static herr_t
 H5VL__pdc_file_close(H5VL_pdc_obj_t *file)
 {
-    perr_t ret;
 #ifdef ENABLE_LOGGING
     fprintf(stderr, "Rank %d: entering %s\n", my_rank_g, __func__);
 #endif
@@ -864,19 +889,27 @@ H5VL__pdc_file_close(H5VL_pdc_obj_t *file)
 
     assert(file);
 
-    // Complete existing write requests
-    ret = _flush_xfer_requests(file);
-    if (ret != SUCCEED)
-        HGOTO_ERROR(H5E_DATASET, H5E_WRITEERROR, FAIL, "Failed to complete deferred writes");
+    /* Objects of the file may outlive H5Fclose */
+    if (--file->refcnt > 0)
+        HGOTO_DONE(SUCCEED);
+
     if (file->req_alloc) {
         free(file->xfer_requests);
         free(file->bufs);
         file->req_alloc = 0;
     }
 
+    if (PDCcont_close(file->cont_id) < 0)
+        HGOTO_ERROR(H5E_FILE, H5E_CANTCLOSEFILE, FAIL, "failed to close container");
+
     /* Free file data structures */
     if (file->file_name)
         free(file->file_name);
+    free(file->path);
+    if (file->fapl_id > 0)
+        H5Pclose(file->fapl_id);
+    if (file->fcpl_id > 0)
+        H5Pclose(file->fcpl_id);
     if (file->comm != MPI_COMM_NULL)
         MPI_Comm_free(&file->comm);
     file->comm = MPI_COMM_NULL;
@@ -913,6 +946,7 @@ H5VL__pdc_dset_init(H5VL_pdc_obj_t *file)
     dset->h5i_type     = H5I_DATASET;
     dset->h5o_type     = H5O_TYPE_DATASET;
     dset->file_obj_ptr = file->file_obj_ptr;
+    dset->file_obj_ptr->refcnt++;
 
     /* Set return value */
     FUNC_RETURN_SET((void *)dset);
@@ -971,6 +1005,720 @@ _pdc_to_h5_type(pdc_var_type_t t)
 }
 
 /*---------------------------------------------------------------------------*/
+/* Hierarchy support.
+ *
+ *   file      -> PDC container named by the file path
+ *   group     -> PDC container nested under its parent container
+ *   dataset   -> PDC object listed in its parent container. PDC object names are
+ *                global, so the name carries the full location:
+ *                <leaf>/<parent path>/<file path>
+ *   attribute -> PDC tag on the object or container, described by an index tag
+ *                (see H5VL_PDC_ATTR_INDEX)
+ *
+ * Link creation order is the order of the container's entries. Lookups are
+ * independent, because HDF5 and CGNS may read metadata on a subset of ranks (CGNS
+ * opens a file on rank 0 alone to detect its type). Changes are collective: rank 0
+ * makes them and the others wait for its status.
+ */
+#define H5VL_PDC_ATTR_INDEX "__h5vol_attr_index"
+
+typedef struct _pdc_loc_t {
+    pdc_entity_type_t type;
+    uint64_t          meta_id;
+    char *            path;     /* path inside the file */
+    char *            pdc_name; /* name PDC knows the entry by */
+} _pdc_loc_t;
+
+static herr_t H5VL_pdc_group_close(void *grp, hid_t dxpl_id, void **req);
+static herr_t _flush_xfer_requests(H5VL_pdc_obj_t *file);
+static herr_t H5VL__pdc_file_close(H5VL_pdc_obj_t *file);
+
+/* Name cache. A container's or object's name never changes for a given id and ids
+ * are not reused, so a name needs fetching once. Listings still come from the server,
+ * so what a group contains is always current. */
+typedef struct _name_slot_t {
+    uint64_t id;
+    char *   name;
+} _name_slot_t;
+
+static _name_slot_t *name_cache_g      = NULL;
+static size_t        name_cache_cap_g  = 0;
+static size_t        name_cache_used_g = 0;
+
+static size_t
+_name_hash(uint64_t id)
+{
+    id ^= id >> 33;
+    id *= 0xff51afd7ed558ccdULL;
+    id ^= id >> 33;
+    return (size_t)id;
+}
+
+static void
+_name_cache_insert(uint64_t id, char *name)
+{
+    size_t i;
+    if ((name_cache_used_g + 1) * 2 > name_cache_cap_g) {
+        size_t        cap = name_cache_cap_g ? name_cache_cap_g * 2 : 1024;
+        _name_slot_t *t   = (_name_slot_t *)calloc(cap, sizeof(_name_slot_t));
+        for (size_t k = 0; k < name_cache_cap_g; k++) {
+            if (name_cache_g[k].id) {
+                i = _name_hash(name_cache_g[k].id) & (cap - 1);
+                while (t[i].id)
+                    i = (i + 1) & (cap - 1);
+                t[i] = name_cache_g[k];
+            }
+        }
+        free(name_cache_g);
+        name_cache_g     = t;
+        name_cache_cap_g = cap;
+    }
+    i = _name_hash(id) & (name_cache_cap_g - 1);
+    while (name_cache_g[i].id)
+        i = (i + 1) & (name_cache_cap_g - 1);
+    name_cache_g[i].id   = id;
+    name_cache_g[i].name = name;
+    name_cache_used_g++;
+}
+
+/* The name PDC holds for an id, or NULL for a dead entry. Owned by the cache. */
+static const char *
+_entry_name(uint64_t id)
+{
+    char *name = NULL;
+    if (name_cache_cap_g) {
+        size_t i = _name_hash(id) & (name_cache_cap_g - 1);
+        while (name_cache_g[i].id) {
+            if (name_cache_g[i].id == id)
+                return name_cache_g[i].name;
+            i = (i + 1) & (name_cache_cap_g - 1);
+        }
+    }
+    if (PDCcont_get((pdcid_t)id, &name) != SUCCEED || name == NULL) {
+        free(name);
+        return NULL;
+    }
+    _name_cache_insert(id, name);
+    return name;
+}
+
+static void
+_name_cache_free(void)
+{
+    for (size_t k = 0; k < name_cache_cap_g; k++)
+        free(name_cache_g[k].name);
+    free(name_cache_g);
+    name_cache_g      = NULL;
+    name_cache_cap_g  = 0;
+    name_cache_used_g = 0;
+}
+
+static H5VL_pdc_obj_t *
+_file_of(H5VL_pdc_obj_t *o)
+{
+    return o->file_obj_ptr ? o->file_obj_ptr : o;
+}
+
+static int
+_is_coll(H5VL_pdc_obj_t *file)
+{
+    return file->comm != MPI_COMM_NULL;
+}
+
+static int
+_is_writer(H5VL_pdc_obj_t *file)
+{
+    return !_is_coll(file) || file->my_rank == 0;
+}
+
+/* A collective change. Lookups are independent and PDC has no transaction: a rank
+ * still checking whether a name exists (as CGNS does before every create) must not
+ * see rank 0's change, or it reports a duplicate. Every rank's earlier lookups are
+ * finished once all have arrived here; rank 0 then changes and the others wait in
+ * _sync_status. */
+static void
+_change_begin(H5VL_pdc_obj_t *file)
+{
+    if (_is_coll(file))
+        MPI_Barrier(file->comm);
+}
+
+/* All ranks of a collective change learn rank 0's result; this also orders them
+ * after rank 0's RPCs have completed. */
+static herr_t
+_sync_status(H5VL_pdc_obj_t *file, herr_t status)
+{
+    int bad = status < 0;
+    if (_is_coll(file))
+        MPI_Bcast(&bad, 1, MPI_INT, 0, file->comm);
+    return bad ? -1 : 0;
+}
+
+static char *
+_path_join(const char *parent, const char *leaf)
+{
+    size_t n = strlen(parent) + strlen(leaf) + 2;
+    char * p = (char *)malloc(n);
+    snprintf(p, n, "%s/%s", parent, leaf);
+    replace_multi_slash(p);
+    return p;
+}
+
+/* PDC name of a dataset. One name per HDF5 path: a leaf has no slash in it. */
+static char *
+_pdc_obj_name(H5VL_pdc_obj_t *file, const char *parent_path, const char *leaf)
+{
+    size_t n = strlen(leaf) + strlen(parent_path) + strlen(file->file_name) + 3;
+    char * p = (char *)malloc(n);
+    snprintf(p, n, "%s/%s/%s", leaf, parent_path, file->file_name);
+    replace_multi_slash(p);
+    return p;
+}
+
+/* Link name of an entry from the name PDC holds for it */
+static char *
+_leaf_of(const char *pdc_name)
+{
+    const char *slash = strchr(pdc_name, '/');
+    size_t      n     = slash ? (size_t)(slash - pdc_name) : strlen(pdc_name);
+    char *      p     = (char *)malloc(n + 1);
+    memcpy(p, pdc_name, n);
+    p[n] = '\0';
+    return p;
+}
+
+static void
+_loc_free(_pdc_loc_t *loc)
+{
+    free(loc->path);
+    free(loc->pdc_name);
+    loc->path = loc->pdc_name = NULL;
+}
+
+/* 0 found, 1 not found, -1 error. cont is a local handle or a meta id. */
+static int
+_find_child(pdcid_t cont, const char *leaf, uint64_t *meta_id, pdc_entity_type_t *type, char **pdc_name,
+            hsize_t *position)
+{
+    int               n = 0, ret = 1;
+    pdc_cont_entry_t *entries = NULL;
+
+    if (PDCcont_get_entries(cont, &n, &entries) != SUCCEED)
+        return -1;
+    for (int i = 0; i < n && ret == 1; i++) {
+        const char *name = _entry_name(entries[i].meta_id);
+        if (name) {
+            char *l = _leaf_of(name);
+            if (strcmp(l, leaf) == 0) {
+                ret = 0;
+                if (meta_id)
+                    *meta_id = entries[i].meta_id;
+                if (type)
+                    *type = entries[i].type;
+                if (position)
+                    *position = (hsize_t)i;
+                if (pdc_name)
+                    *pdc_name = strdup(name);
+            }
+            free(l);
+        }
+    }
+    free(entries);
+    return ret;
+}
+
+/* Follow name from object o. 0 found, 1 not found, -1 error. */
+static int
+_resolve(H5VL_pdc_obj_t *o, const char *name, _pdc_loc_t *loc)
+{
+    H5VL_pdc_obj_t *file = _file_of(o);
+    int             ret  = 0;
+    char *          copy, *comp, *save = NULL;
+
+    memset(loc, 0, sizeof(*loc));
+    if (name[0] == '/') {
+        loc->type    = PDC_ENTITY_CONT;
+        loc->meta_id = file->meta_id;
+        loc->path    = strdup("/");
+    }
+    else {
+        loc->type    = o->h5i_type == H5I_DATASET ? PDC_ENTITY_OBJ : PDC_ENTITY_CONT;
+        loc->meta_id = o->meta_id;
+        loc->path    = strdup(o->path ? o->path : "/");
+        if (o->h5i_type == H5I_DATASET)
+            loc->pdc_name = strdup(o->pdc_name);
+    }
+
+    copy = strdup(name);
+    for (comp = strtok_r(copy, "/", &save); comp && ret == 0; comp = strtok_r(NULL, "/", &save)) {
+        char *            child_name = NULL, *child_path;
+        uint64_t          child_id;
+        pdc_entity_type_t child_type;
+
+        if (strcmp(comp, ".") == 0)
+            continue;
+        if (loc->type != PDC_ENTITY_CONT) {
+            ret = 1;
+            break;
+        }
+        ret = _find_child((pdcid_t)loc->meta_id, comp, &child_id, &child_type, &child_name, NULL);
+        if (ret != 0)
+            break;
+        child_path = _path_join(loc->path, comp);
+        _loc_free(loc);
+        loc->meta_id  = child_id;
+        loc->type     = child_type;
+        loc->path     = child_path;
+        loc->pdc_name = child_name;
+    }
+    free(copy);
+    if (ret != 0)
+        _loc_free(loc);
+    return ret;
+}
+
+/* Split "a/b/c" into parent "a/b" and leaf "c". parent is "." when name has one component. */
+static void
+_split_name(const char *name, char **parent, char **leaf)
+{
+    char * copy = strdup(name);
+    size_t n    = strlen(copy);
+    char * slash;
+
+    while (n > 1 && copy[n - 1] == '/')
+        copy[--n] = '\0';
+    slash = strrchr(copy, '/');
+    if (!slash) {
+        *parent = strdup(".");
+        *leaf   = strdup(copy);
+    }
+    else {
+        *leaf = strdup(slash + 1);
+        if (slash == copy)
+            *parent = strdup("/");
+        else {
+            *slash  = '\0';
+            *parent = strdup(copy);
+        }
+    }
+    free(copy);
+}
+
+static H5VL_pdc_obj_t *
+_open_group_obj(H5VL_pdc_obj_t *file, uint64_t meta_id, const char *path, pdcid_t handle)
+{
+    H5VL_pdc_obj_t *group = H5VL_pdc_new_obj(NULL, file->under_vol_id);
+
+    group->cont_id = handle ? handle : PDCcont_open_id((pdcid_t)meta_id, pdc_id_g);
+    if (group->cont_id == 0) {
+        free(group);
+        return NULL;
+    }
+    group->under_object = group;
+    group->meta_id      = meta_id;
+    group->path         = strdup(path);
+    group->group_name   = strdup(path);
+    group->file_name    = strdup(file->file_name);
+    group->h5i_type     = H5I_GROUP;
+    group->h5o_type     = H5O_TYPE_GROUP;
+    group->comm         = file->comm;
+    group->info         = file->info;
+    group->my_rank      = file->my_rank;
+    group->num_procs    = file->num_procs;
+    group->file_obj_ptr = file;
+    file->refcnt++;
+    return group;
+}
+
+static H5VL_pdc_obj_t *
+_open_dset_obj(H5VL_pdc_obj_t *file, const _pdc_loc_t *loc)
+{
+    H5VL_pdc_obj_t *     dset = NULL;
+    struct pdc_obj_info *info;
+    char *               leaf;
+
+    if (NULL == (dset = H5VL__pdc_dset_init(file)))
+        return NULL;
+    leaf = _leaf_of(loc->pdc_name);
+    strncpy(dset->obj_name, leaf, sizeof(dset->obj_name) - 1);
+    free(leaf);
+    dset->obj_id = PDCobj_open(loc->pdc_name, pdc_id_g);
+    if (dset->obj_id <= 0) {
+        file->refcnt--;
+        free(dset);
+        return NULL;
+    }
+    dset->meta_id      = loc->meta_id;
+    dset->path         = strdup(loc->path);
+    dset->pdc_name     = strdup(loc->pdc_name);
+    dset->under_vol_id = file->under_vol_id;
+    dset->under_object = dset;
+    info               = PDCobj_get_info(dset->obj_id);
+    dset->pdc_type     = info->obj_pt->type;
+
+    // TODO: temporary workaround for writing compound data, as current PDC doesn't support
+    //       compound datatype
+    if (dset->pdc_type == PDC_CHAR) {
+        psize_t        value_size = 0;
+        pdc_var_type_t value_type;
+        psize_t *      value = NULL;
+        PDCobj_get_tag(dset->obj_id, "PDC_COMPOUND_DTYPE_SIZE", (void **)&value, &value_type, &value_size);
+        if (value && value_size > 0) {
+            dset->compound_size = *value;
+            info->obj_pt->dims[info->obj_pt->ndim - 1] /= *value;
+        }
+    }
+    dset->space_id = H5Screate_simple(info->obj_pt->ndim, info->obj_pt->dims, NULL);
+    dset->type_id  = _pdc_to_h5_type(dset->pdc_type);
+    dset->dcpl_id  = H5Pcreate(H5P_DATASET_CREATE);
+    return dset;
+}
+
+static H5VL_pdc_obj_t *
+_open_loc(H5VL_pdc_obj_t *file, const _pdc_loc_t *loc)
+{
+    if (loc->type == PDC_ENTITY_CONT)
+        return _open_group_obj(file, loc->meta_id, loc->path, 0);
+    return _open_dset_obj(file, loc);
+}
+
+static void
+_close_obj(H5VL_pdc_obj_t *o)
+{
+    if (o->h5i_type == H5I_DATASET)
+        H5VL_pdc_dataset_close(o, H5P_DEFAULT, NULL);
+    else
+        H5VL_pdc_group_close(o, H5P_DEFAULT, NULL);
+}
+
+/* The object a loc_params names. *tmp is set when it was opened here and must be closed. */
+static H5VL_pdc_obj_t *
+_loc_owner(H5VL_pdc_obj_t *o, const H5VL_loc_params_t *loc_params, H5VL_pdc_obj_t **tmp)
+{
+    _pdc_loc_t      loc;
+    H5VL_pdc_obj_t *res;
+
+    *tmp = NULL;
+    if (loc_params == NULL || loc_params->type == H5VL_OBJECT_BY_SELF)
+        return o;
+    if (loc_params->type != H5VL_OBJECT_BY_NAME)
+        return NULL;
+    if (strcmp(loc_params->loc_data.loc_by_name.name, ".") == 0)
+        return o;
+    if (_resolve(o, loc_params->loc_data.loc_by_name.name, &loc) != 0)
+        return NULL;
+    res = _open_loc(_file_of(o), &loc);
+    _loc_free(&loc);
+    *tmp = res;
+    return res;
+}
+
+static void
+_token_of(uint64_t meta_id, H5O_token_t *token)
+{
+    memset(token, 0, sizeof(*token));
+    memcpy(token, &meta_id, sizeof(meta_id));
+}
+
+/* Tags: PDC keeps the first value when a name is put twice, so replace explicitly */
+static herr_t
+_tag_get(H5VL_pdc_obj_t *o, const char *name, void **value, psize_t *size, pdc_var_type_t *type)
+{
+    pdc_var_type_t t;
+    *value = NULL;
+    *size  = 0;
+    if (o->obj_id > 0)
+        return PDCobj_get_tag(o->obj_id, (char *)name, value, type ? type : &t, size) == SUCCEED ? 0 : -1;
+    return PDCcont_get_tag(o->cont_id, (char *)name, value, type ? type : &t, size) == SUCCEED ? 0 : -1;
+}
+
+static herr_t
+_tag_del(H5VL_pdc_obj_t *o, const char *name)
+{
+    void *  old = NULL;
+    psize_t size;
+    if (_tag_get(o, name, &old, &size, NULL) < 0 || old == NULL)
+        return 0;
+    free(old);
+    if (o->obj_id > 0)
+        return PDCobj_del_tag(o->obj_id, (char *)name) == SUCCEED ? 0 : -1;
+    return PDCcont_del_tag(o->cont_id, (char *)name) == SUCCEED ? 0 : -1;
+}
+
+static herr_t
+_tag_put(H5VL_pdc_obj_t *o, const char *name, const void *value, psize_t size)
+{
+    if (_tag_del(o, name) < 0)
+        return -1;
+    if (o->obj_id > 0)
+        return PDCobj_put_tag(o->obj_id, (char *)name, (void *)value, PDC_CHAR, size) == SUCCEED ? 0 : -1;
+    return PDCcont_put_tag(o->cont_id, (char *)name, (void *)value, PDC_CHAR, size) == SUCCEED ? 0 : -1;
+}
+
+/* Attribute index: for each attribute, in creation order,
+ *   uint32 name_len, uint32 type_len, uint32 space_len, name, H5Tencode, H5Sencode
+ * It records what a PDC tag cannot: the names, the datatype and the dataspace. */
+typedef struct _attr_rec_t {
+    const char *         name;
+    uint32_t             name_len;
+    const unsigned char *type_buf;
+    uint32_t             type_len;
+    const unsigned char *space_buf;
+    uint32_t             space_len;
+} _attr_rec_t;
+
+static const unsigned char *
+_attr_next(const unsigned char *p, const unsigned char *end, _attr_rec_t *rec)
+{
+    uint32_t h[3];
+    if (p == NULL || (size_t)(end - p) < sizeof(h))
+        return NULL;
+    memcpy(h, p, sizeof(h));
+    p += sizeof(h);
+    rec->name      = (const char *)p;
+    rec->name_len  = h[0];
+    rec->type_buf  = p + h[0];
+    rec->type_len  = h[1];
+    rec->space_buf = rec->type_buf + h[1];
+    rec->space_len = h[2];
+    return rec->space_buf + h[2];
+}
+
+static int
+_attr_find(const unsigned char *buf, psize_t len, const char *name, _attr_rec_t *out, int *position)
+{
+    const unsigned char *p = buf, *end = buf ? buf + len : NULL;
+    _attr_rec_t          rec;
+    int                  i = 0;
+    while ((p = _attr_next(p, end, &rec)) != NULL) {
+        if (strlen(name) == rec.name_len && memcmp(rec.name, name, rec.name_len) == 0) {
+            if (out)
+                *out = rec;
+            if (position)
+                *position = i;
+            return 1;
+        }
+        i++;
+    }
+    return 0;
+}
+
+static herr_t
+_attr_index_add(H5VL_pdc_obj_t *owner, const char *name, hid_t type_id, hid_t space_id)
+{
+    void *         old = NULL;
+    psize_t        old_len;
+    size_t         type_len = 0, space_len = 0, add_len, name_len = strlen(name);
+    unsigned char *buf, *p;
+    uint32_t       h[3];
+    herr_t         ret;
+
+    if (_tag_get(owner, H5VL_PDC_ATTR_INDEX, &old, &old_len, NULL) < 0)
+        return -1;
+    if (old == NULL)
+        old_len = 0;
+    if (H5Tencode(type_id, NULL, &type_len) < 0 || H5Sencode2(space_id, NULL, &space_len, H5P_DEFAULT) < 0)
+        return -1;
+    add_len = sizeof(h) + name_len + type_len + space_len;
+    buf     = (unsigned char *)malloc(old_len + add_len);
+    if (old_len)
+        memcpy(buf, old, old_len);
+    p    = buf + old_len;
+    h[0] = (uint32_t)name_len;
+    h[1] = (uint32_t)type_len;
+    h[2] = (uint32_t)space_len;
+    memcpy(p, h, sizeof(h));
+    p += sizeof(h);
+    memcpy(p, name, name_len);
+    p += name_len;
+    H5Tencode(type_id, p, &type_len);
+    p += type_len;
+    H5Sencode2(space_id, p, &space_len, H5P_DEFAULT);
+    ret = _tag_put(owner, H5VL_PDC_ATTR_INDEX, buf, old_len + add_len);
+    free(buf);
+    free(old);
+    return ret;
+}
+
+static herr_t
+_attr_index_remove(H5VL_pdc_obj_t *owner, const char *name)
+{
+    void *      old = NULL;
+    psize_t     old_len;
+    _attr_rec_t rec;
+    herr_t      ret;
+
+    if (_tag_get(owner, H5VL_PDC_ATTR_INDEX, &old, &old_len, NULL) < 0)
+        return -1;
+    if (old == NULL || !_attr_find(old, old_len, name, &rec, NULL)) {
+        free(old);
+        return -1;
+    }
+    {
+        size_t         rec_start = (const unsigned char *)rec.name - (const unsigned char *)old - 3 * sizeof(uint32_t);
+        size_t         rec_len   = 3 * sizeof(uint32_t) + rec.name_len + rec.type_len + rec.space_len;
+        size_t         new_len   = old_len - rec_len;
+        unsigned char *buf       = (unsigned char *)malloc(new_len ? new_len : 1);
+        memcpy(buf, old, rec_start);
+        memcpy(buf + rec_start, (unsigned char *)old + rec_start + rec_len, new_len - rec_start);
+        if (new_len)
+            ret = _tag_put(owner, H5VL_PDC_ATTR_INDEX, buf, new_len);
+        else
+            ret = _tag_del(owner, H5VL_PDC_ATTR_INDEX);
+        free(buf);
+    }
+    free(old);
+    return ret < 0 ? -1 : _tag_del(owner, name);
+}
+
+/* Remove an entry and everything under it. Caller is the writing rank. */
+static herr_t
+_delete_entry(pdcid_t parent, uint64_t meta_id, pdc_entity_type_t type, const char *pdc_name)
+{
+    pdcid_t           id = (pdcid_t)meta_id;
+    pdc_entity_type_t t  = type;
+    herr_t            ret = 0;
+
+    if (PDCcont_del_entries(parent, 1, &id, &t) != SUCCEED)
+        ret = -1;
+    if (type == PDC_ENTITY_OBJ) {
+        pdcid_t h = PDCobj_open(pdc_name, pdc_id_g);
+        if (h <= 0 || PDCobj_del(h) != SUCCEED)
+            ret = -1;
+        if (h > 0)
+            PDCobj_close(h);
+    }
+    else {
+        pdcid_t           h = PDCcont_open_id(id, pdc_id_g);
+        int               n = 0;
+        pdc_cont_entry_t *entries = NULL;
+        if (h == 0)
+            return -1;
+        if (PDCcont_get_entries(h, &n, &entries) == SUCCEED) {
+            for (int i = 0; i < n; i++) {
+                const char *name = _entry_name(entries[i].meta_id);
+                if (name)
+                    ret |= _delete_entry(h, entries[i].meta_id, entries[i].type, name);
+            }
+            free(entries);
+        }
+        if (PDCcont_del(h) != SUCCEED)
+            ret = -1;
+        PDCcont_close(h);
+    }
+    return ret;
+}
+
+/* H5F_ACC_TRUNC on a container that already exists: start empty again */
+static herr_t
+_truncate_root(H5VL_pdc_obj_t *file)
+{
+    int               n = 0;
+    pdc_cont_entry_t *entries = NULL;
+    void *            idx = NULL;
+    psize_t           idx_len;
+    herr_t            ret = 0;
+
+    if (PDCcont_get_entries(file->cont_id, &n, &entries) != SUCCEED)
+        return -1;
+    for (int i = 0; i < n; i++) {
+        const char *name = _entry_name(entries[i].meta_id);
+        if (name)
+            ret |= _delete_entry(file->cont_id, entries[i].meta_id, entries[i].type, name);
+    }
+    free(entries);
+    if (_tag_get(file, H5VL_PDC_ATTR_INDEX, &idx, &idx_len, NULL) == 0 && idx) {
+        const unsigned char *p = idx, *end = p + idx_len;
+        _attr_rec_t          rec;
+        while ((p = _attr_next(p, end, &rec)) != NULL) {
+            char *name = strndup(rec.name, rec.name_len);
+            ret |= _tag_del(file, name);
+            free(name);
+        }
+        free(idx);
+        ret |= _tag_del(file, H5VL_PDC_ATTR_INDEX);
+    }
+    return ret;
+}
+
+/* Count or list the open objects of a file (H5Fget_obj_count / H5Fget_obj_ids) */
+typedef struct _obj_count_t {
+    H5VL_pdc_obj_t *file;
+    H5I_type_t      type;
+    size_t          max;
+    hid_t *         ids;
+    size_t          count;
+} _obj_count_t;
+
+static herr_t
+_obj_count_cb(hid_t id, void *data)
+{
+    _obj_count_t *c = (_obj_count_t *)data;
+    hbool_t       native = TRUE;
+    void *        obj;
+
+    if (H5VLobject_is_native(id, &native) < 0 || native)
+        return 0;
+    if (NULL == (obj = H5VLobject(id)))
+        return 0;
+    if (c->type == H5I_FILE ? obj != (void *)c->file : ((H5VL_pdc_obj_t *)obj)->file_obj_ptr != c->file)
+        return 0;
+    if (c->ids && c->count < c->max)
+        c->ids[c->count] = id;
+    c->count++;
+    return 0;
+}
+
+static size_t
+_obj_count(H5VL_pdc_obj_t *file, unsigned types, size_t max, hid_t *ids)
+{
+    static const struct {
+        unsigned   flag;
+        H5I_type_t type;
+    } map[] = {{H5F_OBJ_FILE, H5I_FILE}, {H5F_OBJ_DATASET, H5I_DATASET}, {H5F_OBJ_GROUP, H5I_GROUP},
+               {H5F_OBJ_ATTR, H5I_ATTR}};
+    _obj_count_t c = {file, H5I_FILE, max, ids, 0};
+
+    for (size_t i = 0; i < sizeof(map) / sizeof(map[0]); i++) {
+        if (types & map[i].flag) {
+            c.type = map[i].type;
+            H5Iiterate(map[i].type, _obj_count_cb, &c);
+        }
+    }
+    return c.count;
+}
+
+static void
+_fill_oinfo(H5VL_pdc_obj_t *file, uint64_t meta_id, H5O_type_t type, hsize_t num_attrs, H5O_info2_t *oinfo)
+{
+    memset(oinfo, 0, sizeof(*oinfo));
+    oinfo->fileno    = file->meta_id;
+    oinfo->type      = type;
+    oinfo->rc        = 1;
+    oinfo->num_attrs = num_attrs;
+    _token_of(meta_id, &oinfo->token);
+}
+
+static hsize_t
+_attr_count(H5VL_pdc_obj_t *owner)
+{
+    void *               idx = NULL;
+    psize_t              len;
+    hsize_t              count = 0;
+    const unsigned char *p, *end;
+    _attr_rec_t          rec;
+
+    if (_tag_get(owner, H5VL_PDC_ATTR_INDEX, &idx, &len, NULL) < 0 || idx == NULL)
+        return 0;
+    p   = idx;
+    end = p + len;
+    while ((p = _attr_next(p, end, &rec)) != NULL)
+        count++;
+    free(idx);
+    return count;
+}
+
+/*---------------------------------------------------------------------------*/
 static herr_t
 H5VL__pdc_dset_free(H5VL_pdc_obj_t *dset)
 {
@@ -980,15 +1728,19 @@ H5VL__pdc_dset_free(H5VL_pdc_obj_t *dset)
 
     FUNC_ENTER_VOL(herr_t, SUCCEED)
 
-    H5Pclose(dset->dcpl_id);
-    H5Pclose(dset->dapl_id);
-    H5Pclose(dset->dxpl_id);
+    if (dset->dcpl_id > 0)
+        H5Pclose(dset->dcpl_id);
+    if (dset->dapl_id > 0)
+        H5Pclose(dset->dapl_id);
+    if (dset->dxpl_id > 0)
+        H5Pclose(dset->dxpl_id);
+    free(dset->path);
+    free(dset->pdc_name);
     if (dset->type_id != 0)
         H5Tclose(dset->type_id);
     if (dset->space_id != 0 && dset->space_id != H5S_ALL)
         H5Sclose(dset->space_id);
 
-    H5_LIST_REMOVE(dset, entry);
     free(dset);
     dset = NULL;
 
@@ -1029,7 +1781,7 @@ done:
 
 /*---------------------------------------------------------------------------*/
 void *
-H5VL_pdc_file_create(const char *name, unsigned flags, hid_t fcpl_id __attribute__((unused)), hid_t fapl_id,
+H5VL_pdc_file_create(const char *name, unsigned flags, hid_t fcpl_id, hid_t fapl_id,
                      hid_t dxpl_id __attribute__((unused)), void **req __attribute__((unused)))
 {
 #ifdef ENABLE_LOGGING
@@ -1057,6 +1809,17 @@ H5VL_pdc_file_create(const char *name, unsigned flags, hid_t fcpl_id __attribute
 
     if ((file->cont_id = PDCcont_create(name, cont_prop)) <= 0)
         HGOTO_ERROR(H5E_FILE, H5E_CANTCREATE, NULL, "can't create container");
+    file->meta_id = PDCcont_get_info(name)->meta_id;
+    file->fcpl_id = H5Pcopy(fcpl_id);
+
+    /* PDC returns the existing container if the name is taken */
+    {
+        herr_t status = 0;
+        if (_is_writer(file))
+            status = _truncate_root(file);
+        if (_sync_status(file, status) < 0)
+            HGOTO_ERROR(H5E_FILE, H5E_CANTCREATE, NULL, "can't truncate existing container");
+    }
 
     if ((PDCprop_close(cont_prop)) < 0)
         HGOTO_ERROR(H5E_FILE, H5E_CANTCREATE, NULL, "can't close container property");
@@ -1106,6 +1869,8 @@ H5VL_pdc_file_open(const char *name, unsigned flags, hid_t fapl_id, hid_t dxpl_i
 
     if ((file->cont_id = PDCcont_open(name, pdc_id_g)) <= 0)
         HGOTO_ERROR(H5E_FILE, H5E_CANTOPENFILE, NULL, "failed to create container");
+    file->meta_id = PDCcont_get_info(name)->meta_id;
+    file->fcpl_id = H5Pcreate(H5P_FILE_CREATE);
 
     /* Free info */
     if (info && H5VL_pdc_info_free(info) < 0)
@@ -1134,24 +1899,15 @@ H5VL_pdc_file_close(void *_file, hid_t dxpl_id __attribute__((unused)), void **r
     fprintf(stderr, "Rank %d: entering %s\n", my_rank_g, __func__);
 #endif
     H5VL_pdc_obj_t *file = (H5VL_pdc_obj_t *)_file;
-    /* H5VL_pdc_obj_t *dset = NULL; */
-    perr_t ret;
 
     FUNC_ENTER_VOL(herr_t, SUCCEED)
 
     assert(file);
 
-    /* while (!H5_LIST_IS_EMPTY(&file->ids)) { */
-    /*     H5_LIST_GET_FIRST(dset, &file->ids); */
-    /*     H5_LIST_REMOVE(dset, entry); */
-    /*     if (H5VL__pdc_dset_free(dset) < 0) */
-    /*         HGOTO_ERROR(H5E_DATASET, H5E_CANTFREE, FAIL, "failed to free dataset"); */
-    /* } */
+    // Complete existing write requests
+    if (_flush_xfer_requests(file) != SUCCEED)
+        HGOTO_ERROR(H5E_DATASET, H5E_WRITEERROR, FAIL, "Failed to complete deferred writes");
 
-    if ((ret = PDCcont_close(file->cont_id)) < 0)
-        HGOTO_ERROR(H5E_FILE, H5E_CANTCLOSEFILE, FAIL, "failed to close container");
-
-    /* Close the file */
     if (H5VL__pdc_file_close(file) < 0)
         HGOTO_ERROR(H5E_FILE, H5E_CANTCLOSEFILE, FAIL, "failed to close file");
 
@@ -1161,126 +1917,81 @@ done:
 
 /*---------------------------------------------------------------------------*/
 static herr_t
-H5VL_pdc_file_specific(void *file, H5VL_file_specific_args_t *args, hid_t dxpl_id, void **req)
+H5VL_pdc_file_specific(void *file, H5VL_file_specific_args_t *args, hid_t dxpl_id __attribute__((unused)),
+                       void **req __attribute__((unused)))
 {
 #ifdef ENABLE_LOGGING
     fprintf(stderr, "Rank %d: entering %s\n", my_rank_g, __func__);
 #endif
-    H5VL_pdc_obj_t *           o = (H5VL_pdc_obj_t *)file;
-    H5VL_pdc_obj_t *           new_o;
-    H5VL_file_specific_args_t  my_args;
-    H5VL_file_specific_args_t *new_args;
-    H5VL_pdc_info_t *          info;
-    hid_t                      under_vol_id = -1;
-    herr_t                     ret_value    = 0;
+    H5VL_pdc_obj_t *o = (H5VL_pdc_obj_t *)file;
 
-    if (args->op_type == H5VL_FILE_IS_ACCESSIBLE) {
-
-        /* Shallow copy the args */
-
-        memcpy(&my_args, args, sizeof(my_args));
-
-        /* Get copy of our VOL info from FAPL */
-        H5Pget_vol_info(args->args.is_accessible.fapl_id, (void **)&info);
-        /* Make sure we have info about the underlying VOL to be used */
-        if (!info)
-            return (-1);
-
-        /* Keep the correct underlying VOL ID for later */
-        under_vol_id = info->under_vol_id;
-
-        /* Copy the FAPL */
-        my_args.args.is_accessible.fapl_id = H5Pcopy(args->args.is_accessible.fapl_id);
-
-        /* Set the VOL ID and info for the underlying FAPL */
-        H5Pset_vol(my_args.args.is_accessible.fapl_id, info->under_vol_id, info->under_vol_info);
-
-        /* Set argument pointer to new arguments */
-        new_args = &my_args;
-
-        /* Set object pointer for operation */
-        new_o = NULL;
-    } /* end else-if */
-    else if (args->op_type == H5VL_FILE_DELETE) {
-        /* Shallow copy the args */
-        memcpy(&my_args, args, sizeof(my_args));
-
-        /* Get copy of our VOL info from FAPL */
-        H5Pget_vol_info(args->args.del.fapl_id, (void **)&info);
-        /* Make sure we have info about the underlying VOL to be used */
-        if (!info)
-            return (-1);
-
-        /* Keep the correct underlying VOL ID for later */
-        under_vol_id = info->under_vol_id;
-
-        /* Copy the FAPL */
-        my_args.args.del.fapl_id = H5Pcopy(args->args.del.fapl_id);
-
-        /* Set the VOL ID and info for the underlying FAPL */
-        H5Pset_vol(my_args.args.del.fapl_id, info->under_vol_id, info->under_vol_info);
-
-        /* Set argument pointer to new arguments */
-        new_args = &my_args;
-
-        /* Set object pointer for operation */
-        new_o = NULL;
-    } /* end else-if */
-    else {
-        /* Keep the correct underlying VOL ID for later */
-        under_vol_id = o->under_vol_id;
-
-        /* Set argument pointer to current arguments */
-        new_args = args;
-
-        /* Set object pointer for operation */
-        new_o = o->under_object;
-    } /* end else */
-    if (args->op_type == H5VL_FILE_FLUSH) {
-        /* the deferred write queue lives on the file object */
-        H5VL_pdc_obj_t *f = o ? o->file_obj_ptr : NULL;
-        ret_value = _flush_xfer_requests(f ? f : o) == SUCCEED ? 0 : -1;
+    switch (args->op_type) {
+        case H5VL_FILE_FLUSH:
+            /* the deferred write queue lives on the file object */
+            return _flush_xfer_requests(_file_of(o)) == SUCCEED ? 0 : -1;
+        case H5VL_FILE_IS_ACCESSIBLE: {
+            pdcid_t cont = PDCcont_open(args->args.is_accessible.filename, pdc_id_g);
+            *args->args.is_accessible.accessible = cont > 0;
+            if (cont > 0)
+                PDCcont_close(cont);
+            return 0;
+        }
+        case H5VL_FILE_IS_EQUAL:
+            *args->args.is_equal.same_file =
+                _file_of(o)->meta_id == _file_of((H5VL_pdc_obj_t *)args->args.is_equal.obj2)->meta_id;
+            return 0;
+        case H5VL_FILE_REOPEN:
+        case H5VL_FILE_DELETE:
+        default:
+            return -1;
     }
-    else {
-        ret_value = H5VLfile_specific(new_o, under_vol_id, new_args, dxpl_id, req);
-    }
-
-    /* Check for async request */
-    if (req && *req)
-        *req = H5VL_pdc_new_obj(*req, under_vol_id);
-
-    if (args->op_type == H5VL_FILE_IS_ACCESSIBLE) {
-        /* Close underlying FAPL */
-        H5Pclose(my_args.args.is_accessible.fapl_id);
-
-        /* Release copy of our VOL info */
-        H5VL_pdc_info_free(info);
-    } /* end else-if */
-    else if (args->op_type == H5VL_FILE_DELETE) {
-        /* Close underlying FAPL */
-        H5Pclose(my_args.args.del.fapl_id);
-
-        /* Release copy of our VOL info */
-        H5VL_pdc_info_free(info);
-    } /* end else-if */
-    else if (args->op_type == H5VL_FILE_REOPEN) {
-        /* Wrap file struct pointer for 'reopen' operation, if we reopened one */
-        if (ret_value >= 0 && *args->args.reopen.file)
-            *args->args.reopen.file = H5VL_pdc_new_obj(*args->args.reopen.file, under_vol_id);
-    } /* end else */
-
-    return ret_value;
 } /* end H5VL_pdc_file_specific() */
 
 /*---------------------------------------------------------------------------*/
 static herr_t
-H5VL_pdc_file_get(void *file __attribute__((unused)), H5VL_file_get_args_t *args __attribute__((unused)),
-                  hid_t dxpl_id __attribute__((unused)), void **req __attribute__((unused)))
+H5VL_pdc_file_get(void *_file, H5VL_file_get_args_t *args, hid_t dxpl_id __attribute__((unused)),
+                  void **req __attribute__((unused)))
 {
 #ifdef ENABLE_LOGGING
     fprintf(stderr, "Rank %d: entering %s\n", my_rank_g, __func__);
 #endif
-    return 0;
+    H5VL_pdc_obj_t *file = _file_of((H5VL_pdc_obj_t *)_file);
+
+    switch (args->op_type) {
+        case H5VL_FILE_GET_FAPL:
+            args->args.get_fapl.fapl_id = H5Pcopy(file->fapl_id);
+            return args->args.get_fapl.fapl_id < 0 ? -1 : 0;
+        case H5VL_FILE_GET_FCPL:
+            args->args.get_fcpl.fcpl_id = H5Pcopy(file->fcpl_id);
+            return args->args.get_fcpl.fcpl_id < 0 ? -1 : 0;
+        case H5VL_FILE_GET_FILENO:
+            *args->args.get_fileno.fileno = file->meta_id;
+            return 0;
+        case H5VL_FILE_GET_INTENT:
+            *args->args.get_intent.flags = (file->flags & (H5F_ACC_RDWR | H5F_ACC_TRUNC | H5F_ACC_EXCL | H5F_ACC_CREAT))
+                                               ? H5F_ACC_RDWR
+                                               : H5F_ACC_RDONLY;
+            return 0;
+        case H5VL_FILE_GET_NAME: {
+            size_t len = strlen(file->file_name);
+            if (args->args.get_name.buf && args->args.get_name.buf_size > 0) {
+                strncpy(args->args.get_name.buf, file->file_name, args->args.get_name.buf_size - 1);
+                args->args.get_name.buf[args->args.get_name.buf_size - 1] = '\0';
+            }
+            *args->args.get_name.file_name_len = len;
+            return 0;
+        }
+        case H5VL_FILE_GET_OBJ_COUNT:
+            *args->args.get_obj_count.count = _obj_count(file, args->args.get_obj_count.types, 0, NULL);
+            return 0;
+        case H5VL_FILE_GET_OBJ_IDS:
+            *args->args.get_obj_ids.count = _obj_count(file, args->args.get_obj_ids.types,
+                                                       args->args.get_obj_ids.max_objs, args->args.get_obj_ids.oid_list);
+            return 0;
+        case H5VL_FILE_GET_CONT_INFO:
+        default:
+            return -1;
+    }
 } /* end H5VL_pdc_file_get() */
 
 /*---------------------------------------------------------------------------*/
@@ -1301,41 +2012,39 @@ H5VL_pdc_dataset_create(void *obj, const H5VL_loc_params_t *loc_params, const ch
                         hid_t dapl_id, hid_t dxpl_id, void **req __attribute__((unused)))
 {
     H5VL_pdc_obj_t *o = (H5VL_pdc_obj_t *)obj;
-    int             buff_len, ndim;
+    H5VL_pdc_obj_t *file = _file_of(o);
+    int             ndim;
     H5T_class_t     dclass;
     H5VL_pdc_obj_t *dset = NULL;
-    pdcid_t         obj_prop, obj_id;
+    pdcid_t         obj_prop, obj_id, parent;
     hsize_t         dims[H5S_MAX_RANK];
+    char *          parent_name = NULL, *leaf = NULL, *new_name = NULL;
+    _pdc_loc_t      parent_loc;
+    int             have_parent = 0;
+    pdc_entity_type_t obj_type  = PDC_ENTITY_OBJ;
 
     FUNC_ENTER_VOL(void *, NULL)
 
 #ifdef ENABLE_LOGGING
-    fprintf(stderr, "Rank %d: entered dataset_create [%s][%s][%s]\n", o->my_rank, o->file_name, o->group_name,
-            name);
+    fprintf(stderr, "Rank %d: entered dataset_create [%s][%s][%s]\n", o->my_rank, o->file_name, o->path, name);
 #endif
 
-    if (o->group_name) {
-        buff_len = strlen(name) + strlen(o->file_name) + strlen(o->group_name) + 3;
+    if (!name)
+        HGOTO_ERROR(H5E_ARGS, H5E_BADVALUE, NULL, "dataset name is NULL");
+    _split_name(name, &parent_name, &leaf);
+    if (_resolve(o, parent_name, &parent_loc) != 0 || parent_loc.type != PDC_ENTITY_CONT)
+        HGOTO_ERROR(H5E_DATASET, H5E_CANTCREATE, NULL, "parent group does not exist");
+    have_parent = 1;
+    _change_begin(file);
+    {
+        herr_t status = 0;
+        if (_is_writer(file) && _find_child((pdcid_t)parent_loc.meta_id, leaf, NULL, NULL, NULL, NULL) != 1)
+            status = -1;
+        if (_sync_status(file, status) < 0)
+            HGOTO_ERROR(H5E_DATASET, H5E_CANTCREATE, NULL, "name already exists");
     }
-    else {
-        buff_len = strlen(name) + strlen(o->file_name) + 2;
-    }
-    char new_name[buff_len];
-    if (o->group_name) {
-        strcpy(new_name, name);
-        strcat(new_name, "/");
-        strcat(new_name, o->group_name);
-        strcat(new_name, "/");
-        strcat(new_name, o->file_name);
-    }
-    else {
-        strcpy(new_name, name);
-        strcat(new_name, "/");
-        strcat(new_name, o->file_name);
-    }
-    /* Assume that the name, group name, and file_name do not include multiple consecutive
-       slashes as a part of their names. */
-    replace_multi_slash(new_name);
+    parent   = parent_loc.meta_id == o->meta_id ? o->cont_id : PDCcont_open_id((pdcid_t)parent_loc.meta_id, pdc_id_g);
+    new_name = _pdc_obj_name(file, parent_loc.path, leaf);
 
     if (!obj)
         HGOTO_ERROR(H5E_ARGS, H5E_BADVALUE, NULL, "parent object is NULL");
@@ -1424,18 +2133,27 @@ H5VL_pdc_dataset_create(void *obj, const H5VL_loc_params_t *loc_params, const ch
     PDCprop_set_obj_dims(obj_prop, ndim, dims);
 
     /* Create PDC object */
-    if (o->comm != MPI_COMM_NULL) {
+    if (_is_coll(file)) {
 #ifdef ENABLE_LOGGING
         fprintf(stderr, "Rank %d: PDC obj create mpi [%s]\n", o->my_rank, new_name);
 #endif
-        obj_id = PDCobj_create_mpi(o->cont_id, new_name, obj_prop, 0, o->comm);
+        obj_id = PDCobj_create_coll(parent, new_name, obj_prop, 0, file->comm);
     }
     else {
 #ifdef ENABLE_LOGGING
         fprintf(stderr, "Rank %d: PDC obj create [%s]\n", o->my_rank, new_name);
 #endif
-        obj_id = PDCobj_create(o->cont_id, new_name, obj_prop);
+        obj_id = PDCobj_create(parent, new_name, obj_prop);
     }
+    if (obj_id <= 0)
+        HGOTO_ERROR(H5E_DATASET, H5E_CANTCREATE, NULL, "can't create PDC object");
+
+    /* The parent lists its datasets; that listing is the link */
+    if ((_is_coll(file) ? PDCcont_put_entries_coll(parent, 1, &obj_id, &obj_type, file->comm)
+                        : PDCcont_put_entries(parent, 1, &obj_id, &obj_type)) != SUCCEED)
+        HGOTO_ERROR(H5E_DATASET, H5E_CANTCREATE, NULL, "can't link PDC object into its parent");
+    if (parent != o->cont_id)
+        PDCcont_close(parent);
 
 #ifdef ENABLE_LOGGING
     fprintf(stderr, "Rank %d: PDC obj id %lu, dims %lu\n", o->my_rank, obj_id, dims[0]);
@@ -1450,9 +2168,13 @@ H5VL_pdc_dataset_create(void *obj, const H5VL_loc_params_t *loc_params, const ch
     dset->obj_id   = obj_id;
     dset->h5i_type = H5I_DATASET;
     dset->h5o_type = H5O_TYPE_DATASET;
-    strcpy(dset->obj_name, name);
+    dset->meta_id  = PDCobj_get_info(obj_id)->meta_id;
+    dset->path     = _path_join(parent_loc.path, leaf);
+    dset->pdc_name = strdup(new_name);
+    dset->under_vol_id = file->under_vol_id;
+    dset->under_object = dset;
+    strncpy(dset->obj_name, leaf, sizeof(dset->obj_name) - 1);
     o->nobj++;
-    H5_LIST_INSERT_HEAD(&o->ids, dset, entry);
 
     if ((PDCprop_close(obj_prop)) < 0)
         HGOTO_ERROR(H5E_DATASET, H5E_CANTCREATE, NULL, "can't close object property");
@@ -1461,97 +2183,33 @@ H5VL_pdc_dataset_create(void *obj, const H5VL_loc_params_t *loc_params, const ch
     FUNC_RETURN_SET((void *)dset);
 
 done:
+    if (have_parent)
+        _loc_free(&parent_loc);
+    free(parent_name);
+    free(leaf);
+    free(new_name);
     FUNC_LEAVE_VOL
 }
 
 /*---------------------------------------------------------------------------*/
 static void *
-H5VL_pdc_dataset_open(void *obj, const H5VL_loc_params_t *loc_params, const char *_name,
+H5VL_pdc_dataset_open(void *obj, const H5VL_loc_params_t *loc_params __attribute__((unused)), const char *_name,
                       hid_t dapl_id __attribute__((unused)), hid_t dxpl_id __attribute__((unused)),
                       void **req __attribute__((unused)))
 {
 #ifdef ENABLE_LOGGING
     fprintf(stderr, "Rank %d: entering %s\n", my_rank_g, __func__);
 #endif
+    H5VL_pdc_obj_t *o    = (H5VL_pdc_obj_t *)obj;
+    H5VL_pdc_obj_t *dset = NULL;
+    _pdc_loc_t      loc;
 
-    FUNC_ENTER_VOL(void *, NULL)
-
-    H5VL_pdc_obj_t *     o    = (H5VL_pdc_obj_t *)obj;
-    H5VL_pdc_obj_t *     dset = NULL;
-    struct pdc_obj_info *obj_info;
-
-    int buff_len;
-    if (o->group_name) {
-        buff_len = strlen(_name) + strlen(o->file_name) + strlen(o->group_name) + 3;
-    }
-    else {
-        buff_len = strlen(_name) + strlen(o->file_name) + 2;
-    }
-
-    char name[buff_len];
-    if (o->group_name) {
-        strcpy(name, _name);
-        strcat(name, "/");
-        strcat(name, o->group_name);
-        strcat(name, "/");
-        strcat(name, o->file_name);
-    }
-    else {
-        strcpy(name, _name);
-        strcat(name, "/");
-        strcat(name, o->file_name);
-    }
-    /* Assume that the name, group name, and file_name do not include multiple consecutive
-       slashes as a part of their names. */
-    replace_multi_slash(name);
-
-    if (!obj)
-        HGOTO_ERROR(H5E_ARGS, H5E_BADVALUE, NULL, "parent object is NULL");
-    if (!loc_params)
-        HGOTO_ERROR(H5E_ARGS, H5E_BADVALUE, NULL, "location parameters object is NULL");
-    if (0 == strlen(name))
-        HGOTO_ERROR(H5E_ARGS, H5E_BADVALUE, NULL, "dataset name is NULL");
-
-    /* Init dataset */
-    if (NULL == (dset = H5VL__pdc_dset_init(o)))
-        HGOTO_ERROR(H5E_DATASET, H5E_CANTINIT, NULL, "can't init PDC dataset struct");
-
-    strcpy(dset->obj_name, name);
-    dset->obj_id = PDCobj_open(name, pdc_id_g);
-    if (dset->obj_id <= 0) {
-        free(dset);
+    if (_resolve(o, _name, &loc) != 0)
         return NULL;
-    }
-    dset->under_vol_id = o->under_vol_id;
-    dset->under_object = dset;
-    /* pdcid_t id_name    = (pdcid_t)name; */
-    obj_info       = PDCobj_get_info(dset->obj_id);
-    dset->pdc_type = obj_info->obj_pt->type;
-
-    // TODO: temporary workaround for writing compound data, as current PDC doesn't support
-    //       compound datatype
-    if (dset->pdc_type == PDC_CHAR) {
-        psize_t        value_size;
-        pdc_var_type_t value_type;
-        psize_t *      value;
-        PDCobj_get_tag(dset->obj_id, "PDC_COMPOUND_DTYPE_SIZE", (void **)&value, &value_type, &value_size);
-        if (value_size > 0) {
-            dset->compound_size = *value;
-            obj_info->obj_pt->dims[obj_info->obj_pt->ndim - 1] /= *value;
-        }
-    }
-
-    dset->space_id = H5Screate_simple(obj_info->obj_pt->ndim, obj_info->obj_pt->dims, NULL);
-    if (dset->type_id <= 0)
-        dset->type_id = _pdc_to_h5_type(dset->pdc_type);
-    o->nobj++;
-    H5_LIST_INSERT_HEAD(&o->ids, dset, entry);
-
-    /* Set return value */
-    FUNC_RETURN_SET((void *)dset);
-
-done:
-    FUNC_LEAVE_VOL
+    if (loc.type == PDC_ENTITY_OBJ)
+        dset = _open_dset_obj(_file_of(o), &loc);
+    _loc_free(&loc);
+    return dset;
 } /* end H5VL_pdc_dataset_open() */
 
 int
@@ -1655,6 +2313,97 @@ _flush_xfer_requests(H5VL_pdc_obj_t *file)
 }
 
 /*---------------------------------------------------------------------------*/
+/* What a dataset transfer touches in the file: one box of the dataset. PDC regions
+ * are boxes, so other selections are refused rather than written to the wrong place. */
+static herr_t
+_file_box(H5VL_pdc_obj_t *dset, hid_t file_space, int *ndim, uint64_t *off, uint64_t *cnt, hsize_t *npoints)
+{
+    hid_t   space = (file_space == H5S_ALL) ? dset->space_id : file_space;
+    hsize_t dims[H5S_MAX_RANK], start[H5S_MAX_RANK], end[H5S_MAX_RANK], box = 1;
+    H5S_sel_type sel = file_space == H5S_ALL ? H5S_SEL_ALL : H5Sget_select_type(space);
+
+    if ((*ndim = H5Sget_simple_extent_dims(dset->space_id, dims, NULL)) < 0)
+        return -1;
+    if (*ndim > 4)
+        return -1; /* PDC regions */
+    if (sel == H5S_SEL_NONE) {
+        *npoints = 0;
+        return 0;
+    }
+    if (sel == H5S_SEL_ALL) {
+        for (int i = 0; i < *ndim; i++) {
+            off[i] = 0;
+            cnt[i] = dims[i];
+            box *= dims[i];
+        }
+    }
+    else {
+        hssize_t n = H5Sget_select_npoints(space);
+        if (n < 0 || H5Sget_select_bounds(space, start, end) < 0)
+            return -1;
+        for (int i = 0; i < *ndim; i++) {
+            off[i] = start[i];
+            cnt[i] = end[i] - start[i] + 1;
+            box *= cnt[i];
+        }
+        if ((hsize_t)n != box)
+            return -1; /* not a single box */
+    }
+    *npoints = box;
+    return 0;
+}
+
+/* Whether the memory selection is one contiguous run from the start of the buffer */
+static int
+_mem_is_contig(hid_t mem_space, hsize_t npoints)
+{
+    if (mem_space == H5S_ALL)
+        return 1;
+    if (H5Sget_select_type(mem_space) == H5S_SEL_ALL)
+        return 1;
+    return (hsize_t)H5Sget_simple_extent_npoints(mem_space) == npoints;
+}
+
+/* Datasets that no datatype conversion is needed for */
+static int
+_same_type(hid_t a, hid_t b)
+{
+    return H5Tequal(a, b) > 0 || H5Tget_class(a) == H5T_COMPOUND || H5Tget_class(b) == H5T_COMPOUND;
+}
+
+/* Convert n elements in buf (sized for the larger type). A string and a one-byte
+ * integer hold the same bytes, and HDF5 will not convert between those classes. */
+static herr_t
+_convert(hid_t from, hid_t to, size_t n, void *buf)
+{
+    if (H5Tget_size(from) == H5Tget_size(to) &&
+        (H5Tget_class(from) == H5T_STRING || H5Tget_class(to) == H5T_STRING))
+        return 0;
+    return H5Tconvert(from, to, n, buf, NULL, H5P_DEFAULT);
+}
+
+static herr_t
+H5VL__pdc_gather_cb(const void *dst_buf __attribute__((unused)), size_t dst_buf_bytes_used __attribute__((unused)),
+                    void *op_data __attribute__((unused)))
+{
+    return 0; /* called when the buffer fills; it is sized for the whole selection */
+}
+
+/* H5Dscatter asks a callback for the packed data; here it is one buffer, passed as op_data */
+typedef struct _scatter_src_t {
+    const void *buf;
+    size_t      size;
+} _scatter_src_t;
+
+static herr_t
+H5VL__pdc_scatter_src(const void **src_buf, size_t *src_buf_bytes_used, void *op_data)
+{
+    _scatter_src_t *src = (_scatter_src_t *)op_data;
+    *src_buf            = src->buf;
+    *src_buf_bytes_used = src->size;
+    return 0;
+}
+
 herr_t
 H5VL_pdc_dataset_write(size_t count, void *_dset[], hid_t mem_type_id[], hid_t mem_space_id[],
                        hid_t file_space_id[], hid_t plist_id __attribute__((unused)), const void *buf[],
@@ -1665,103 +2414,62 @@ H5VL_pdc_dataset_write(size_t count, void *_dset[], hid_t mem_type_id[], hid_t m
 #endif
 
     H5VL_pdc_obj_t *dset, *file;
-    uint64_t        offset[H5S_MAX_RANK] = {0}, total_size = 0;
-    size_t          type_size;
-    int             ndim;
-    pdcid_t         region_local, region_remote;
-    hsize_t         dims[H5S_MAX_RANK] = {0};
-    perr_t          ret;
-    pdcid_t         transfer_request;
-    H5T_class_t     h5_dclass;
-    void *          cache_buf = NULL;
 
     FUNC_ENTER_VOL(herr_t, SUCCEED)
 
     for (size_t u = 0; u < count; u++) {
+        uint64_t off[H5S_MAX_RANK] = {0}, cnt[H5S_MAX_RANK] = {0}, zero[H5S_MAX_RANK] = {0};
+        hsize_t  npoints;
+        int      ndim;
+        size_t   mem_size, file_size, total;
+        void *   cache_buf;
+        pdcid_t  region_local, region_remote, transfer_request;
+
         dset = (H5VL_pdc_obj_t *)_dset[u];
         file = dset->file_obj_ptr;
 
-#ifdef ENABLE_LOGGING
-        fprintf(stderr, "Rank %d: writing [%s][%s][%s]\n", my_rank_g, dset->file_name, dset->group_name,
-                dset->obj_name);
-#endif
-        if (file_space_id[u] == H5S_ALL)
-            file_space_id[u] = dset->space_id;
-        if (mem_space_id[u] == H5S_ALL)
-            mem_space_id[u] = file_space_id[u];
+        if (_file_box(dset, file_space_id[u], &ndim, off, cnt, &npoints) < 0)
+            HGOTO_ERROR(H5E_DATASET, H5E_UNSUPPORTED, FAIL, "vol-pdc transfers a single box of a dataset");
+        if (npoints == 0)
+            continue;
 
-        h5_dclass = H5Tget_class(mem_type_id[u]);
-        if (_check_mem_type_id(h5_dclass, dset->pdc_type) == 0)
-            HGOTO_ERROR(H5E_DATASET, H5E_UNSUPPORTED, FAIL, "vol-pdc does not support datatype conversion");
+        mem_size  = H5Tget_size(mem_type_id[u]);
+        file_size = H5Tget_size(dset->type_id);
+        total     = (size_t)npoints * (mem_size > file_size ? mem_size : file_size);
+        cache_buf = malloc(total);
 
-        /* Get memory dataspace object */
-        if ((ndim = H5Sget_simple_extent_ndims(mem_space_id[u])) < 0)
-            HGOTO_ERROR(H5E_DATASET, H5E_CANTGET, FAIL, "can't get number of dimensions");
-        if (ndim != H5Sget_simple_extent_dims(mem_space_id[u], dims, NULL))
-            HGOTO_ERROR(H5E_DATASET, H5E_CANTGET, FAIL, "can't get dimensions");
+        if (_mem_is_contig(mem_space_id[u], npoints))
+            memcpy(cache_buf, buf[u], (size_t)npoints * mem_size);
+        else if (H5Dgather(mem_space_id[u], buf[u], mem_type_id[u], total, cache_buf, H5VL__pdc_gather_cb, NULL) < 0)
+            HGOTO_ERROR(H5E_DATASET, H5E_WRITEERROR, FAIL, "can't gather memory selection");
 
-        if (ndim > 4)
-            HGOTO_ERROR(H5E_DATASET, H5E_UNSUPPORTED, FAIL, "data dimension not supported");
-
-        total_size = 1;
-        for (int i = 0; i < ndim; i++)
-            total_size *= dims[i];
+        if (!_same_type(mem_type_id[u], dset->type_id) &&
+            _convert(mem_type_id[u], dset->type_id, (size_t)npoints, cache_buf) < 0)
+            HGOTO_ERROR(H5E_DATASET, H5E_WRITEERROR, FAIL, "can't convert datatype");
 
         // TODO: temporary workaround for writing compound data, as current PDC doesn't support
         //       compound datatype
-        type_size = H5Tget_size(mem_type_id[u]);
-        if (H5Tget_class(mem_type_id[u]) == H5T_COMPOUND)
-            dims[ndim - 1] *= type_size;
+        if (H5Tget_class(dset->type_id) == H5T_COMPOUND) {
+            off[ndim - 1] *= file_size;
+            cnt[ndim - 1] *= file_size;
+        }
 
-        total_size *= type_size;
-
-        /* printf("Rank %d: mem offset %lu\n", dset->my_rank, offset[0]); */
-        /* printf("Rank %d: mem count  %lu\n", dset->my_rank, dims[0]); */
-        region_local      = PDCregion_create(ndim, offset, dims);
+        region_local      = PDCregion_create(ndim, zero, cnt);
         dset->reg_id_from = region_local;
+        region_remote     = PDCregion_create(ndim, off, cnt);
+        dset->reg_id_to   = region_remote;
 
-        /* H5VL__pdc_sel_to_recx_iov(file_space_id[u], type_size, offset); */
-        H5VL__pdc_sel_to_recx_iov(file_space_id[u], 1, offset);
+        transfer_request =
+            PDCregion_transfer_create(cache_buf, PDC_WRITE, dset->obj_id, region_local, region_remote);
+        if (transfer_request == 0)
+            HGOTO_ERROR(H5E_DATASET, H5E_WRITEERROR, FAIL, "can't create transfer");
+        _add_xfer_request(file, transfer_request, cache_buf);
+        write_cache_size_g += total;
 
-#ifdef ENABLE_LOGGING
-        printf("Rank %d: file offset0 %lu, count0 %lu\n", my_rank_g, offset[0], dims[0]);
-        if (ndim > 1)
-            printf("Rank %d: file offset1 %lu, count1 %lu\n", my_rank_g, offset[1], dims[1]);
-#endif
-        region_remote   = PDCregion_create(ndim, offset, dims);
-        dset->reg_id_to = region_remote;
-
-        if (file->req_alloc == 0) {
-            file->req_alloc     = 64;
-            file->req_cnt       = 0;
-            file->xfer_requests = (pdcid_t *)calloc(file->req_alloc, sizeof(pdcid_t));
-            file->bufs          = (void **)calloc(file->req_alloc, sizeof(void *));
-        }
-
-        if (write_cache_size_g + total_size > MAX_WRITE_CACHE_SIZE_GB * 1073741824llu) {
-            // Reaching max cache size, finish existing transfer requests and the current one
-            transfer_request = PDCregion_transfer_create((void *)buf[u], PDC_WRITE, dset->obj_id,
-                                                         region_local, region_remote);
-
-            _add_xfer_request(file, transfer_request, NULL);
-
-            ret = _flush_xfer_requests(file);
-            if (ret != SUCCEED)
-                HGOTO_ERROR(H5E_DATASET, H5E_WRITEERROR, FAIL, "Failed to complete deferred writes");
-        }
-        else {
-            // Cache the user buffer
-            cache_buf = malloc(total_size);
-            memcpy(cache_buf, buf[u], total_size);
-            write_cache_size_g += total_size;
-
-            transfer_request =
-                PDCregion_transfer_create(cache_buf, PDC_WRITE, dset->obj_id, region_local, region_remote);
-
-            _add_xfer_request(file, transfer_request, cache_buf);
-        }
-
-        // Defer xfer wait to the next read operation and file close time
+        /* Deferred to the next read, flush or close, unless the cache is full */
+        if (write_cache_size_g > MAX_WRITE_CACHE_SIZE_GB * 1073741824llu &&
+            _flush_xfer_requests(file) != SUCCEED)
+            HGOTO_ERROR(H5E_DATASET, H5E_WRITEERROR, FAIL, "Failed to complete deferred writes");
     }
 
 done:
@@ -1779,13 +2487,6 @@ H5VL_pdc_dataset_read(size_t count, void *_dset[], hid_t mem_type_id[], hid_t me
 #endif
 
     H5VL_pdc_obj_t *dset, *file;
-    uint64_t        offset[H5S_MAX_RANK] = {0};
-    int             ndim, i;
-    pdcid_t         region_local, region_remote;
-    hsize_t         dims[H5S_MAX_RANK] = {0};
-    perr_t          ret;
-    pdcid_t         transfer_request;
-    H5T_class_t     h5_dclass;
 
     FUNC_ENTER_VOL(herr_t, SUCCEED)
 
@@ -1796,43 +2497,43 @@ H5VL_pdc_dataset_read(size_t count, void *_dset[], hid_t mem_type_id[], hid_t me
         HGOTO_ERROR(H5E_DATASET, H5E_WRITEERROR, FAIL, "Failed to complete deferred writes");
 
     for (size_t u = 0; u < count; u++) {
+        uint64_t off[H5S_MAX_RANK] = {0}, cnt[H5S_MAX_RANK] = {0}, zero[H5S_MAX_RANK] = {0};
+        hsize_t  npoints;
+        int      ndim, contig, direct;
+        size_t   mem_size, file_size, total;
+        void *   target;
+        pdcid_t  region_local, region_remote, transfer_request;
+        perr_t   ret;
+
         dset = (H5VL_pdc_obj_t *)_dset[u];
 
-        h5_dclass = H5Tget_class(mem_type_id[u]);
-        if (_check_mem_type_id(h5_dclass, dset->pdc_type) == 0)
-            HGOTO_ERROR(H5E_DATASET, H5E_UNSUPPORTED, FAIL, "vol-pdc does not support datatype conversion");
+        if (_file_box(dset, file_space_id[u], &ndim, off, cnt, &npoints) < 0)
+            HGOTO_ERROR(H5E_DATASET, H5E_UNSUPPORTED, FAIL, "vol-pdc transfers a single box of a dataset");
+        if (npoints == 0)
+            continue;
 
-        /* Get memory dataspace object */
-        if (mem_space_id[u] == H5S_ALL) {
-            if ((ndim = H5Sget_simple_extent_ndims(dset->space_id)) < 0)
-                HGOTO_ERROR(H5E_DATASET, H5E_CANTGET, FAIL, "can't get number of dimensions");
-            if (ndim != H5Sget_simple_extent_dims(dset->space_id, dims, NULL))
-                HGOTO_ERROR(H5E_DATASET, H5E_CANTGET, FAIL, "can't get dimensions");
-        }
-        else {
-            if ((ndim = H5Sget_simple_extent_ndims(mem_space_id[u])) < 0)
-                HGOTO_ERROR(H5E_DATASET, H5E_CANTGET, FAIL, "can't get number of dimensions");
-            if (ndim != H5Sget_simple_extent_dims(mem_space_id[u], dims, NULL))
-                HGOTO_ERROR(H5E_DATASET, H5E_CANTGET, FAIL, "can't get dimensions");
-        }
+        mem_size  = H5Tget_size(mem_type_id[u]);
+        file_size = H5Tget_size(dset->type_id);
+        total     = (size_t)npoints * (mem_size > file_size ? mem_size : file_size);
+        contig    = _mem_is_contig(mem_space_id[u], npoints);
+        direct    = contig && _same_type(mem_type_id[u], dset->type_id);
+        target    = direct ? buf[u] : malloc(total);
 
         // TODO: temporary workaround for reading compound data, as current PDC doesn't support
         //       compound datatype
         if (dset->compound_size > 0) {
-            dims[ndim - 1] *= dset->compound_size;
+            off[ndim - 1] *= dset->compound_size;
+            cnt[ndim - 1] *= dset->compound_size;
         }
 
-        region_local      = PDCregion_create(ndim, offset, dims);
+        region_local      = PDCregion_create(ndim, zero, cnt);
         dset->reg_id_from = region_local;
+        region_remote     = PDCregion_create(ndim, off, cnt);
+        dset->reg_id_to   = region_remote;
 
-        if (file_space_id[u] != H5S_ALL)
-            H5VL__pdc_sel_to_recx_iov(file_space_id[u], 1, offset);
-
-        region_remote   = PDCregion_create(ndim, offset, dims);
-        dset->reg_id_to = region_remote;
-
-        transfer_request =
-            PDCregion_transfer_create((void *)buf[u], PDC_READ, dset->obj_id, region_local, region_remote);
+        transfer_request = PDCregion_transfer_create(target, PDC_READ, dset->obj_id, region_local, region_remote);
+        if (transfer_request == 0)
+            HGOTO_ERROR(H5E_DATASET, H5E_READERROR, FAIL, "can't create transfer");
         ret = PDCregion_transfer_start(transfer_request);
         if (ret != SUCCEED) {
             HGOTO_ERROR(H5E_DATASET, H5E_WRITEERROR, FAIL, "Failed to region transfer start");
@@ -1845,7 +2546,21 @@ H5VL_pdc_dataset_read(size_t count, void *_dset[], hid_t mem_type_id[], hid_t me
         if (ret != SUCCEED) {
             HGOTO_ERROR(H5E_DATASET, H5E_CLOSEERROR, FAIL, "Failed to region transfer close");
         }
-    } // End for u < count
+
+        if (!direct) {
+            if (!_same_type(mem_type_id[u], dset->type_id) &&
+                _convert(dset->type_id, mem_type_id[u], (size_t)npoints, target) < 0)
+                HGOTO_ERROR(H5E_DATASET, H5E_READERROR, FAIL, "can't convert datatype");
+            if (contig)
+                memcpy(buf[u], target, (size_t)npoints * mem_size);
+            else {
+                _scatter_src_t src = {target, (size_t)npoints * mem_size};
+                if (H5Dscatter(H5VL__pdc_scatter_src, &src, mem_type_id[u], mem_space_id[u], buf[u]) < 0)
+                    HGOTO_ERROR(H5E_DATASET, H5E_READERROR, FAIL, "can't scatter to memory selection");
+            }
+            free(target);
+        }
+    }
 
 done:
     FUNC_LEAVE_VOL
@@ -1894,11 +2609,18 @@ done:
 
 /*---------------------------------------------------------------------------*/
 static herr_t
-H5VL_pdc_dataset_specific(void *                        obj __attribute__((unused)),
-                          H5VL_dataset_specific_args_t *args __attribute__((unused)),
-                          hid_t dxpl_id __attribute__((unused)), void **req __attribute__((unused)))
+H5VL_pdc_dataset_specific(void *obj, H5VL_dataset_specific_args_t *args, hid_t dxpl_id __attribute__((unused)),
+                          void **req __attribute__((unused)))
 {
-    return 0;
+    switch (args->op_type) {
+        case H5VL_DATASET_FLUSH:
+            return _flush_xfer_requests(_file_of((H5VL_pdc_obj_t *)obj)) == SUCCEED ? 0 : -1;
+        case H5VL_DATASET_REFRESH:
+            return 0;
+        case H5VL_DATASET_SET_EXTENT:
+        default:
+            return -1;
+    }
 } /* end H5VL_pdc_dataset_specific() */
 
 /*---------------------------------------------------------------------------*/
@@ -1937,11 +2659,13 @@ H5VL_pdc_dataset_close(void *_dset, hid_t dxpl_id __attribute__((unused)), void 
             HGOTO_ERROR(H5E_DATASET, H5E_CLOSEERROR, FAIL, "can't close remote region");
     }
 
-    if (dset->mapped == 1)
-        H5_LIST_REMOVE(dset, entry);
-
-    if (H5VL__pdc_dset_free(dset) < 0)
-        HGOTO_ERROR(H5E_DATASET, H5E_CLOSEERROR, FAIL, "can't free dataset");
+    {
+        H5VL_pdc_obj_t *file = dset->file_obj_ptr;
+        if (H5VL__pdc_dset_free(dset) < 0)
+            HGOTO_ERROR(H5E_DATASET, H5E_CLOSEERROR, FAIL, "can't free dataset");
+        if (H5VL__pdc_file_close(file) < 0)
+            HGOTO_ERROR(H5E_DATASET, H5E_CLOSEERROR, FAIL, "can't release file");
+    }
 
 done:
     FUNC_LEAVE_VOL
@@ -2004,25 +2728,16 @@ H5VL_pdc_datatype_close(void *dt __attribute__((unused)), hid_t dxpl_id __attrib
 } /* end H5VL_pdc_datatype_close() */
 
 /*---------------------------------------------------------------------------*/
-herr_t
-H5VL_pdc_introspect_get_conn_cls(void *obj, H5VL_get_conn_lvl_t lvl, const H5VL_class_t **conn_cls)
+static herr_t
+H5VL_pdc_introspect_get_conn_cls(void *obj __attribute__((unused)), H5VL_get_conn_lvl_t lvl __attribute__((unused)),
+                                 const H5VL_class_t **conn_cls)
 {
 #ifdef ENABLE_LOGGING
     fprintf(stderr, "Rank %d: entering %s\n", my_rank_g, __func__);
 #endif
-
-    H5VL_pdc_obj_t *o = (H5VL_pdc_obj_t *)obj;
-    herr_t          ret_value;
-
-    /* Check for querying this connector's class */
-    if (H5VL_GET_CONN_LVL_CURR == lvl) {
-        *conn_cls = &H5VL_pdc_g;
-        ret_value = 0;
-    } /* end if */
-    else
-        ret_value = H5VLintrospect_get_conn_cls(o->under_object, o->under_vol_id, lvl, conn_cls);
-
-    return ret_value;
+    /* This is a terminal connector: there is nothing under it to ask */
+    *conn_cls = &H5VL_pdc_g;
+    return 0;
 } /* end H5VL_pdc_introspect_get_conn_cls() */
 
 /*---------------------------------------------------------------------------*/
@@ -2062,89 +2777,123 @@ H5VL_pdc_introspect_opt_query(void *obj __attribute__((unused)), H5VL_subclass_t
 
 /*---------------------------------------------------------------------------*/
 static void *
-// store group name in pdc_obj
-// retrieve file name and concatenate with group name, create pdc container (check code in file create)
 H5VL_pdc_group_create(void *obj, const H5VL_loc_params_t *loc_params __attribute__((unused)),
                       const char *name, hid_t lcpl_id __attribute__((unused)),
                       hid_t gcpl_id __attribute__((unused)), hid_t gapl_id __attribute__((unused)),
-                      hid_t dxpl_id __attribute__((unused)), void **req)
+                      hid_t dxpl_id __attribute__((unused)), void **req __attribute__((unused)))
 {
 #ifdef ENABLE_LOGGING
     fprintf(stderr, "Rank %d: entering %s\n", my_rank_g, __func__);
 #endif
+    H5VL_pdc_obj_t *o     = (H5VL_pdc_obj_t *)obj;
+    H5VL_pdc_obj_t *file  = _file_of(o);
+    H5VL_pdc_obj_t *group = NULL;
+    char *          parent_name, *leaf, *path = NULL;
+    _pdc_loc_t      parent_loc;
+    pdcid_t         parent = 0, prop = 0, child = 0;
+    uint64_t        child_id;
 
-    H5VL_pdc_obj_t *group;
-    H5VL_pdc_obj_t *o          = (H5VL_pdc_obj_t *)obj;
-    void *          under      = NULL;
-    char *          group_name = (char *)calloc(1, strlen(name) + 1);
-    strcpy(group_name, name);
+    _split_name(name, &parent_name, &leaf);
+    if (_resolve(o, parent_name, &parent_loc) != 0) {
+        free(parent_name);
+        free(leaf);
+        return NULL;
+    }
+    if (parent_loc.type != PDC_ENTITY_CONT)
+        goto done;
+    _change_begin(file);
+    {
+        herr_t status = 0;
+        if (_is_writer(file) && _find_child((pdcid_t)parent_loc.meta_id, leaf, NULL, NULL, NULL, NULL) != 1)
+            status = -1;
+        if (_sync_status(file, status) < 0)
+            goto done;
+    }
 
-    group             = H5VL_pdc_new_obj(under, o->under_vol_id);
-    group->group_name = group_name;
-    group->h5i_type   = H5I_GROUP;
-    group->h5o_type   = H5O_TYPE_GROUP;
+    parent = parent_loc.meta_id == o->meta_id && o->h5i_type != H5I_DATASET
+                 ? o->cont_id
+                 : PDCcont_open_id((pdcid_t)parent_loc.meta_id, pdc_id_g);
+    prop   = PDCprop_create(PDC_CONT_CREATE, pdc_id_g);
+    child  = _is_coll(file) ? PDCcont_create_at_coll(parent, leaf, prop, file->comm)
+                            : PDCcont_create_at(parent, leaf, prop);
+    if (child == 0 || _find_child(parent, leaf, &child_id, NULL, NULL, NULL) != 0)
+        goto done;
+    path  = _path_join(parent_loc.path, leaf);
+    group = _open_group_obj(file, child_id, path, child);
 
-    char *file_name = (char *)calloc(1, strlen(o->file_name) + 1);
-    strcpy(file_name, o->file_name);
-    group->file_name = file_name;
-
-    group->comm         = o->comm;
-    group->info         = o->info;
-    group->cont_id      = o->cont_id;
-    group->file_obj_ptr = o->file_obj_ptr;
-
-    /* Check for async request */
-    if (req && *req)
-        *req = H5VL_pdc_new_obj(*req, o->under_vol_id);
-
+done:
+    if (prop)
+        PDCprop_close(prop);
+    if (parent && parent != o->cont_id)
+        PDCcont_close(parent);
+    _loc_free(&parent_loc);
+    free(parent_name);
+    free(leaf);
+    free(path);
     return (void *)group;
 } /* end H5VL_pdc_group_create() */
 
 /*---------------------------------------------------------------------------*/
 static void *
 H5VL_pdc_group_open(void *obj, const H5VL_loc_params_t *loc_params __attribute__((unused)), const char *name,
-                    hid_t gapl_id __attribute__((unused)), hid_t dxpl_id __attribute__((unused)), void **req)
+                    hid_t gapl_id __attribute__((unused)), hid_t dxpl_id __attribute__((unused)),
+                    void **req __attribute__((unused)))
 {
 #ifdef ENABLE_LOGGING
     fprintf(stderr, "Rank %d: entering %s\n", my_rank_g, __func__);
 #endif
+    H5VL_pdc_obj_t *o     = (H5VL_pdc_obj_t *)obj;
+    H5VL_pdc_obj_t *group = NULL;
+    _pdc_loc_t      loc;
 
-    H5VL_pdc_obj_t *group;
-    H5VL_pdc_obj_t *o          = (H5VL_pdc_obj_t *)obj;
-    void *          under      = NULL;
-    char *          group_name = (char *)calloc(1, strlen(name) + 1);
-    strcpy(group_name, name);
-
-    group             = H5VL_pdc_new_obj(under, o->under_vol_id);
-    group->group_name = group_name;
-    group->h5i_type   = H5I_GROUP;
-    group->h5o_type   = H5O_TYPE_GROUP;
-
-    char *file_name = (char *)calloc(1, strlen(o->file_name) + 1);
-    strcpy(file_name, o->file_name);
-    group->file_name = file_name;
-
-    group->comm         = o->comm;
-    group->info         = o->info;
-    group->cont_id      = o->cont_id;
-    group->file_obj_ptr = o->file_obj_ptr;
-
-    /* Check for async request */
-    if (req && *req)
-        *req = H5VL_pdc_new_obj(*req, o->under_vol_id);
-
+    if (_resolve(o, name, &loc) != 0)
+        return NULL;
+    if (loc.type == PDC_ENTITY_CONT)
+        group = _open_group_obj(_file_of(o), loc.meta_id, loc.path, 0);
+    _loc_free(&loc);
     return (void *)group;
 } /* end H5VL_pdc_group_open() */
 
 /*---------------------------------------------------------------------------*/
 static herr_t
-H5VL_pdc_group_get(void *obj __attribute__((unused)), H5VL_group_get_args_t *args __attribute__((unused)),
-                   hid_t dxpl_id __attribute__((unused)), void **req __attribute__((unused)))
+H5VL_pdc_group_get(void *obj, H5VL_group_get_args_t *args, hid_t dxpl_id __attribute__((unused)),
+                   void **req __attribute__((unused)))
 {
 #ifdef ENABLE_LOGGING
     fprintf(stderr, "Rank %d: entering %s\n", my_rank_g, __func__);
 #endif
-    return 0;
+    H5VL_pdc_obj_t *o = (H5VL_pdc_obj_t *)obj;
+
+    switch (args->op_type) {
+        case H5VL_GROUP_GET_GCPL: {
+            /* The entries of a container are in creation order */
+            hid_t gcpl = H5Pcreate(H5P_GROUP_CREATE);
+            H5Pset_link_creation_order(gcpl, H5P_CRT_ORDER_TRACKED | H5P_CRT_ORDER_INDEXED);
+            args->args.get_gcpl.gcpl_id = gcpl;
+            return gcpl < 0 ? -1 : 0;
+        }
+        case H5VL_GROUP_GET_INFO: {
+            H5VL_pdc_obj_t *tmp, *owner = _loc_owner(o, &args->args.get_info.loc_params, &tmp);
+            int             n = 0;
+            pdc_cont_entry_t *entries = NULL;
+            herr_t          ret = -1;
+            if (owner && owner->h5i_type != H5I_DATASET &&
+                PDCcont_get_entries(owner->cont_id, &n, &entries) == SUCCEED) {
+                H5G_info_t *info   = args->args.get_info.ginfo;
+                info->storage_type = H5G_STORAGE_TYPE_DENSE;
+                info->nlinks       = (hsize_t)n;
+                info->max_corder   = (int64_t)n;
+                info->mounted      = FALSE;
+                free(entries);
+                ret = 0;
+            }
+            if (tmp)
+                _close_obj(tmp);
+            return ret;
+        }
+        default:
+            return -1;
+    }
 } /* end H5VL_pdc_group_get() */
 
 /*---------------------------------------------------------------------------*/
@@ -2166,14 +2915,24 @@ H5VL_pdc_group_optional(void *obj __attribute__((unused)), H5VL_optional_args_t 
 
 /*---------------------------------------------------------------------------*/
 static herr_t
-H5VL_pdc_group_close(void *grp __attribute__((unused)), hid_t dxpl_id __attribute__((unused)),
-                     void **req __attribute__((unused)))
+H5VL_pdc_group_close(void *grp, hid_t dxpl_id __attribute__((unused)), void **req __attribute__((unused)))
 {
 #ifdef ENABLE_LOGGING
     fprintf(stderr, "Rank %d: entering %s\n", my_rank_g, __func__);
 #endif
+    H5VL_pdc_obj_t *group = (H5VL_pdc_obj_t *)grp;
+    H5VL_pdc_obj_t *file  = group->file_obj_ptr;
+    herr_t          ret   = 0;
 
-    return 0;
+    if (PDCcont_close(group->cont_id) != SUCCEED)
+        ret = -1;
+    free(group->path);
+    free(group->group_name);
+    free(group->file_name);
+    free(group);
+    if (H5VL__pdc_file_close(file) < 0)
+        ret = -1;
+    return ret;
 } /* end H5VL_pdc_group_close() */
 
 /*---------------------------------------------------------------------------*/
@@ -2183,7 +2942,9 @@ H5VL_pdc_link_create(H5VL_link_create_args_t *args __attribute__((unused)), void
                      hid_t lcpl_id __attribute__((unused)), hid_t lapl_id __attribute__((unused)),
                      hid_t dxpl_id __attribute__((unused)), void **req __attribute__((unused)))
 {
-    return 0;
+    /* Hard, soft and external links are not supported. Report it rather than
+     * returning success for a link that was never made. */
+    return -1;
 } /* end H5VL_pdc_link_create() */
 
 /*---------------------------------------------------------------------------*/
@@ -2195,7 +2956,7 @@ H5VL_pdc_link_copy(void *                   src_obj __attribute__((unused)),
                    hid_t lcpl_id __attribute__((unused)), hid_t lapl_id __attribute__((unused)),
                    hid_t dxpl_id __attribute__((unused)), void **req __attribute__((unused)))
 {
-    return 0;
+    return -1;
 } /* end H5VL_pdc_link_copy() */
 
 /*---------------------------------------------------------------------------*/
@@ -2207,27 +2968,180 @@ H5VL_pdc_link_move(void *                   src_obj __attribute__((unused)),
                    hid_t lcpl_id __attribute__((unused)), hid_t lapl_id __attribute__((unused)),
                    hid_t dxpl_id __attribute__((unused)), void **req __attribute__((unused)))
 {
-    return 0;
+    return -1;
 } /* end H5VL_pdc_link_move() */
 
 /*---------------------------------------------------------------------------*/
 static herr_t
-H5VL_pdc_link_get(void *                   obj __attribute__((unused)),
-                  const H5VL_loc_params_t *loc_params __attribute__((unused)),
-                  H5VL_link_get_args_t *args __attribute__((unused)), hid_t dxpl_id __attribute__((unused)),
-                  void **req __attribute__((unused)))
+H5VL_pdc_link_get(void *obj, const H5VL_loc_params_t *loc_params, H5VL_link_get_args_t *args,
+                  hid_t dxpl_id __attribute__((unused)), void **req __attribute__((unused)))
 {
-    return 0;
+    H5VL_pdc_obj_t *o = (H5VL_pdc_obj_t *)obj;
+
+    if (args->op_type == H5VL_LINK_GET_INFO && loc_params->type == H5VL_OBJECT_BY_NAME) {
+        char *       parent_name, *leaf;
+        _pdc_loc_t   parent_loc;
+        uint64_t     id;
+        hsize_t      position;
+        herr_t       ret = -1;
+        H5L_info2_t *linfo = args->args.get_info.linfo;
+
+        _split_name(loc_params->loc_data.loc_by_name.name, &parent_name, &leaf);
+        if (_resolve(o, parent_name, &parent_loc) == 0) {
+            if (parent_loc.type == PDC_ENTITY_CONT &&
+                _find_child((pdcid_t)parent_loc.meta_id, leaf, &id, NULL, NULL, &position) == 0) {
+                memset(linfo, 0, sizeof(*linfo));
+                linfo->type        = H5L_TYPE_HARD;
+                linfo->corder_valid = TRUE;
+                linfo->corder      = (int64_t)position;
+                linfo->cset        = H5T_CSET_ASCII;
+                _token_of(id, &linfo->u.token);
+                ret = 0;
+            }
+            _loc_free(&parent_loc);
+        }
+        free(parent_name);
+        free(leaf);
+        return ret;
+    }
+    return -1;
 } /* end H5VL_pdc_link_get() */
 
 /*---------------------------------------------------------------------------*/
+typedef struct _link_rec_t {
+    char *   name;
+    uint64_t meta_id;
+    hsize_t  corder;
+} _link_rec_t;
+
+static int
+_link_rec_cmp(const void *a, const void *b)
+{
+    return strcmp(((const _link_rec_t *)a)->name, ((const _link_rec_t *)b)->name);
+}
+
 static herr_t
-H5VL_pdc_link_specific(void *                     obj __attribute__((unused)),
-                       const H5VL_loc_params_t *  loc_params __attribute__((unused)),
-                       H5VL_link_specific_args_t *args __attribute__((unused)),
+_link_iterate(H5VL_pdc_obj_t *owner, H5VL_link_iterate_args_t *it)
+{
+    H5VL_pdc_obj_t *  file = _file_of(owner);
+    int               n = 0, nrec = 0;
+    pdc_cont_entry_t *entries = NULL;
+    _link_rec_t *     recs;
+    herr_t            ret = 0;
+    hsize_t           start;
+    H5VL_pdc_obj_t *  self;
+    hid_t             gid;
+
+    if (it->recursive || owner->h5i_type == H5I_DATASET)
+        return -1;
+    if (PDCcont_get_entries(owner->cont_id, &n, &entries) != SUCCEED)
+        return -1;
+    recs = (_link_rec_t *)calloc(n ? n : 1, sizeof(_link_rec_t));
+    for (int i = 0; i < n; i++) {
+        const char *name = _entry_name(entries[i].meta_id);
+        if (name) {
+            recs[nrec].name    = _leaf_of(name);
+            recs[nrec].meta_id = entries[i].meta_id;
+            recs[nrec].corder  = (hsize_t)nrec;
+            nrec++;
+        }
+    }
+    free(entries);
+    if (it->idx_type == H5_INDEX_NAME)
+        qsort(recs, nrec, sizeof(_link_rec_t), _link_rec_cmp);
+
+    /* The callback takes an ID for the group being iterated */
+    self = _open_group_obj(file, owner->meta_id, owner->path ? owner->path : "/", 0);
+    gid  = self ? H5VLwrap_register(self, H5I_GROUP) : H5I_INVALID_HID;
+    if (gid < 0)
+        ret = -1;
+
+    start = it->idx_p ? *it->idx_p : 0;
+    for (hsize_t k = start; ret == 0 && k < (hsize_t)nrec; k++) {
+        _link_rec_t *r = &recs[it->order == H5_ITER_DEC ? (hsize_t)nrec - 1 - k : k];
+        H5L_info2_t  linfo;
+
+        memset(&linfo, 0, sizeof(linfo));
+        linfo.type         = H5L_TYPE_HARD;
+        linfo.corder_valid = TRUE;
+        linfo.corder       = (int64_t)r->corder;
+        linfo.cset         = H5T_CSET_ASCII;
+        _token_of(r->meta_id, &linfo.u.token);
+        ret = it->op(gid, r->name, &linfo, it->op_data);
+        if (it->idx_p)
+            *it->idx_p = k + 1;
+    }
+    if (gid >= 0)
+        H5Idec_ref(gid);
+    for (int i = 0; i < nrec; i++)
+        free(recs[i].name);
+    free(recs);
+    return ret;
+}
+
+static herr_t
+H5VL_pdc_link_specific(void *obj, const H5VL_loc_params_t *loc_params, H5VL_link_specific_args_t *args,
                        hid_t dxpl_id __attribute__((unused)), void **req __attribute__((unused)))
 {
-    return 0;
+    H5VL_pdc_obj_t *o    = (H5VL_pdc_obj_t *)obj;
+    H5VL_pdc_obj_t *file = _file_of(o);
+
+    switch (args->op_type) {
+        case H5VL_LINK_EXISTS: {
+            _pdc_loc_t loc;
+            int        found;
+            if (loc_params->type != H5VL_OBJECT_BY_NAME)
+                return -1;
+            found = _resolve(o, loc_params->loc_data.loc_by_name.name, &loc);
+            if (found < 0)
+                return -1;
+            if (found == 0)
+                _loc_free(&loc);
+            *args->args.exists.exists = found == 0;
+            return 0;
+        }
+        case H5VL_LINK_ITER: {
+            H5VL_pdc_obj_t *tmp, *owner = _loc_owner(o, loc_params, &tmp);
+            herr_t          ret;
+            if (owner == NULL)
+                return -1;
+            ret = _link_iterate(owner, &args->args.iterate);
+            if (tmp)
+                _close_obj(tmp);
+            return ret;
+        }
+        case H5VL_LINK_DELETE: {
+            char *            parent_name, *leaf, *pdc_name = NULL;
+            _pdc_loc_t        parent_loc;
+            uint64_t          id;
+            pdc_entity_type_t type;
+            herr_t            status = -1;
+
+            if (loc_params->type != H5VL_OBJECT_BY_NAME)
+                return -1;
+            if (_flush_xfer_requests(file) != SUCCEED)
+                return -1;
+            _change_begin(file);
+            _split_name(loc_params->loc_data.loc_by_name.name, &parent_name, &leaf);
+            if (_is_writer(file) && _resolve(o, parent_name, &parent_loc) == 0) {
+                if (parent_loc.type == PDC_ENTITY_CONT &&
+                    _find_child((pdcid_t)parent_loc.meta_id, leaf, &id, &type, &pdc_name, NULL) == 0) {
+                    pdcid_t parent = PDCcont_open_id((pdcid_t)parent_loc.meta_id, pdc_id_g);
+                    if (parent) {
+                        status = _delete_entry(parent, id, type, pdc_name);
+                        PDCcont_close(parent);
+                    }
+                    free(pdc_name);
+                }
+                _loc_free(&parent_loc);
+            }
+            free(parent_name);
+            free(leaf);
+            return _sync_status(file, status);
+        }
+        default:
+            return -1;
+    }
 } /* end H5VL_pdc_link_specific() */
 
 /*---------------------------------------------------------------------------*/
@@ -2241,200 +3155,294 @@ H5VL_pdc_link_optional(void *                   obj __attribute__((unused)),
 } /* end H5VL_pdc_link_optional() */
 
 /*---------------------------------------------------------------------------*/
+static H5VL_pdc_obj_t *
+_new_attr_obj(H5VL_pdc_obj_t *owner, H5VL_pdc_obj_t *tmp, const char *name, hid_t type_id, hid_t space_id)
+{
+    H5VL_pdc_obj_t *file = _file_of(owner);
+    H5VL_pdc_obj_t *attr = H5VL_pdc_new_obj(NULL, owner->under_vol_id);
+
+    attr->under_object    = attr;
+    attr->attr_name       = strdup(name);
+    attr->attr_type       = type_id;
+    attr->attr_space      = space_id;
+    attr->attr_value_size = (psize_t)H5Sget_simple_extent_npoints(space_id) * H5Tget_size(type_id);
+    attr->obj_id          = owner->obj_id;
+    attr->cont_id         = owner->cont_id;
+    attr->file_obj_ptr    = file;
+    attr->h5i_type        = H5I_ATTR;
+    attr->attr_owner_tmp  = tmp;
+    file->refcnt++;
+    return attr;
+}
+
 static void *
-H5VL_pdc_attr_create(void *obj, const H5VL_loc_params_t *loc_params __attribute__((unused)), const char *name,
-                     hid_t type_id, hid_t space_id, hid_t acpl_id __attribute__((unused)),
-                     hid_t aapl_id __attribute__((unused)), hid_t dxpl_id __attribute__((unused)), void **req)
+H5VL_pdc_attr_create(void *obj, const H5VL_loc_params_t *loc_params, const char *name, hid_t type_id,
+                     hid_t space_id, hid_t acpl_id __attribute__((unused)),
+                     hid_t aapl_id __attribute__((unused)), hid_t dxpl_id __attribute__((unused)),
+                     void **req __attribute__((unused)))
 {
 #ifdef ENABLE_LOGGING
     fprintf(stderr, "Rank %d: entering %s\n", my_rank_g, __func__);
 #endif
+    H5VL_pdc_obj_t *o = (H5VL_pdc_obj_t *)obj, *tmp;
+    H5VL_pdc_obj_t *owner = _loc_owner(o, loc_params, &tmp);
+    H5VL_pdc_obj_t *file  = _file_of(o);
+    herr_t          status = -1;
 
-    H5VL_pdc_obj_t *attr;
-    H5VL_pdc_obj_t *o     = (H5VL_pdc_obj_t *)obj;
-    void *          under = NULL;
-    psize_t         value_size;
-
-    char *attr_name = (char *)malloc(strlen(name) + 1);
-    strcpy(attr_name, name);
-    attr                  = H5VL_pdc_new_obj(under, o->under_vol_id);
-    attr->attr_name       = attr_name;
-    value_size            = H5Sget_select_npoints(space_id) * H5Tget_size(type_id);
-    attr->attr_value_size = value_size;
-    attr->obj_id          = o->obj_id;
-    attr->cont_id         = o->cont_id;
-
-    attr->h5i_type = H5I_ATTR;
-    /* attr->h5o_type = H5O_TYPE_ATTR; */
-
-    /* Check for async request */
-    if (req && *req)
-        *req = H5VL_pdc_new_obj(*req, o->under_vol_id);
-
-    return (void *)attr;
+    if (owner == NULL)
+        return NULL;
+    _change_begin(file);
+    if (_is_writer(file)) {
+        void *  idx = NULL;
+        psize_t len;
+        if (_tag_get(owner, H5VL_PDC_ATTR_INDEX, &idx, &len, NULL) == 0 &&
+            !(idx && _attr_find(idx, len, name, NULL, NULL)))
+            status = _attr_index_add(owner, name, type_id, space_id);
+        free(idx);
+    }
+    if (_sync_status(file, status) < 0) {
+        if (tmp)
+            _close_obj(tmp);
+        return NULL;
+    }
+    return (void *)_new_attr_obj(owner, tmp, name, H5Tcopy(type_id), H5Scopy(space_id));
 } /* end H5VL_pdc_attr_create() */
 /*---------------------------------------------------------------------------*/
 static void *
-H5VL_pdc_attr_open(void *obj, const H5VL_loc_params_t *loc_params __attribute__((unused)), const char *name,
+H5VL_pdc_attr_open(void *obj, const H5VL_loc_params_t *loc_params, const char *name,
                    hid_t aapl_id __attribute__((unused)), hid_t dxpl_id __attribute__((unused)),
                    void **req __attribute__((unused)))
 {
 #ifdef ENABLE_LOGGING
     fprintf(stderr, "Rank %d: entering %s\n", my_rank_g, __func__);
 #endif
-    H5VL_pdc_obj_t *attr;
-    H5VL_pdc_obj_t *o         = (H5VL_pdc_obj_t *)obj;
-    void *          under     = NULL;
-    char *          attr_name = (char *)malloc(strlen(name) + 1);
-    strcpy(attr_name, name);
-    o->attr_name = attr_name;
+    H5VL_pdc_obj_t *o = (H5VL_pdc_obj_t *)obj, *tmp, *attr = NULL;
+    H5VL_pdc_obj_t *owner = _loc_owner(o, loc_params, &tmp);
+    void *          idx   = NULL;
+    psize_t         len;
+    _attr_rec_t     rec;
 
-    attr            = H5VL_pdc_new_obj(under, o->under_vol_id);
-    attr->attr_name = attr_name;
-    attr->obj_id    = o->obj_id;
-    attr->cont_id   = o->cont_id;
-
+    if (owner == NULL)
+        return NULL;
+    if (_tag_get(owner, H5VL_PDC_ATTR_INDEX, &idx, &len, NULL) == 0 && idx && _attr_find(idx, len, name, &rec, NULL))
+        attr = _new_attr_obj(owner, tmp, name, H5Tdecode(rec.type_buf), H5Sdecode(rec.space_buf));
+    else if (tmp)
+        _close_obj(tmp);
+    free(idx);
     return (void *)attr;
 } /* end H5VL_pdc_attr_open() */
 /*---------------------------------------------------------------------------*/
 static perr_t
-H5VL_pdc_attr_read(void *attr, hid_t mem_type_id __attribute__((unused)), void *buf,
-                   hid_t dxpl_id __attribute__((unused)), void **req)
+H5VL_pdc_attr_read(void *attr, hid_t mem_type_id, void *buf, hid_t dxpl_id __attribute__((unused)),
+                   void **req __attribute__((unused)))
 {
 #ifdef ENABLE_LOGGING
     fprintf(stderr, "Rank %d: entering %s\n", my_rank_g, __func__);
 #endif
     H5VL_pdc_obj_t *o         = (H5VL_pdc_obj_t *)attr;
     void *          tag_value = NULL;
-    perr_t          ret_value = FAIL;
-    pdc_var_type_t  value_type;
+    psize_t         size      = 0;
+    size_t          npoints   = (size_t)H5Sget_simple_extent_npoints(o->attr_space);
+    size_t          file_size = H5Tget_size(o->attr_type), mem_size = H5Tget_size(mem_type_id);
+    herr_t          ret = 0;
 
-    if (o->obj_id > 0) {
-        ret_value =
-            PDCobj_get_tag(o->obj_id, (char *)o->attr_name, &tag_value, &value_type, &(o->attr_value_size));
+    if (_tag_get(o, o->attr_name, &tag_value, &size, NULL) < 0)
+        return -1;
+    if (tag_value == NULL) {
+        /* created but never written: HDF5 returns the fill value */
+        memset(buf, 0, npoints * mem_size);
+        return 0;
     }
-    else if (o->cont_id > 0) {
-        ret_value =
-            PDCcont_get_tag(o->cont_id, (char *)o->attr_name, &tag_value, &value_type, &(o->attr_value_size));
+    if (H5Tequal(mem_type_id, o->attr_type) > 0 || H5Tget_class(mem_type_id) == H5T_STRING ||
+        H5Tget_class(o->attr_type) == H5T_STRING) {
+        /* no numeric conversion; a string is bytes up to the smaller size */
+        size_t want = npoints * mem_size;
+        memset(buf, 0, want);
+        memcpy(buf, tag_value, want < (size_t)size ? want : (size_t)size);
     }
-    memcpy(buf, tag_value, o->attr_value_size);
-    if (tag_value)
-        free(tag_value);
-
-    /* Check for async request */
-    if (req && *req)
-        *req = H5VL_pdc_new_obj(*req, o->under_vol_id);
-
-    return ret_value;
+    else {
+        size_t         tconv = npoints * (file_size > mem_size ? file_size : mem_size);
+        unsigned char *conv  = (unsigned char *)malloc(tconv);
+        memcpy(conv, tag_value, npoints * file_size);
+        ret = H5Tconvert(o->attr_type, mem_type_id, npoints, conv, NULL, H5P_DEFAULT);
+        if (ret >= 0)
+            memcpy(buf, conv, npoints * mem_size);
+        free(conv);
+    }
+    free(tag_value);
+    return ret < 0 ? -1 : 0;
 } /* end H5VL_pdc_attr_read() */
 
 /*---------------------------------------------------------------------------*/
 static perr_t
-H5VL_pdc_attr_write(void *attr, hid_t mem_type_id __attribute__((unused)), const void *buf,
-                    hid_t dxpl_id __attribute__((unused)), void **req)
+H5VL_pdc_attr_write(void *attr, hid_t mem_type_id, const void *buf, hid_t dxpl_id __attribute__((unused)),
+                    void **req __attribute__((unused)))
 {
 #ifdef ENABLE_LOGGING
     fprintf(stderr, "Rank %d: entering %s\n", my_rank_g, __func__);
 #endif
-
     H5VL_pdc_obj_t *o         = (H5VL_pdc_obj_t *)attr;
-    herr_t          ret_value = FAIL;
+    H5VL_pdc_obj_t *file      = o->file_obj_ptr;
+    size_t          npoints   = (size_t)H5Sget_simple_extent_npoints(o->attr_space);
+    size_t          file_size = H5Tget_size(o->attr_type), mem_size = H5Tget_size(mem_type_id);
+    herr_t          status    = 0;
 
-    if (o->obj_id > 0)
-        ret_value =
-            PDCobj_put_tag(o->obj_id, (char *)o->attr_name, (void *)buf, PDC_CHAR, o->attr_value_size);
-    else if (o->cont_id > 0)
-        ret_value =
-            PDCcont_put_tag(o->cont_id, (char *)o->attr_name, (void *)buf, PDC_CHAR, o->attr_value_size);
-    /* else */
-    /*     HGOTO_ERROR(H5E_VOL, H5E_WRITEERROR, FAIL, "no valid PDC obj/cont ID"); */
-
-    /* Check for async request */
-    if (req && *req)
-        *req = H5VL_pdc_new_obj(*req, o->under_vol_id);
-
-    return ret_value;
+    _change_begin(file);
+    if (_is_writer(file)) {
+        if (H5Tequal(mem_type_id, o->attr_type) > 0 || H5Tget_class(mem_type_id) == H5T_STRING ||
+            H5Tget_class(o->attr_type) == H5T_STRING) {
+            size_t         stored = npoints * file_size, have = npoints * mem_size;
+            unsigned char *value  = (unsigned char *)calloc(stored ? stored : 1, 1);
+            memcpy(value, buf, have < stored ? have : stored);
+            status = _tag_put(o, o->attr_name, value, stored);
+            free(value);
+        }
+        else {
+            size_t         tconv = npoints * (file_size > mem_size ? file_size : mem_size);
+            unsigned char *conv  = (unsigned char *)malloc(tconv);
+            memcpy(conv, buf, npoints * mem_size);
+            status = H5Tconvert(mem_type_id, o->attr_type, npoints, conv, NULL, H5P_DEFAULT);
+            if (status >= 0)
+                status = _tag_put(o, o->attr_name, conv, npoints * file_size);
+            free(conv);
+        }
+    }
+    return _sync_status(file, status);
 } /* end H5VL_pdc_attr_write() */
 
 /*---------------------------------------------------------------------------*/
 static herr_t
-H5VL_pdc_attr_get(void *obj, H5VL_attr_get_args_t *args, hid_t dxpl_id __attribute__((unused)), void **req)
+H5VL_pdc_attr_get(void *obj, H5VL_attr_get_args_t *args, hid_t dxpl_id __attribute__((unused)),
+                  void **req __attribute__((unused)))
 {
 #ifdef ENABLE_LOGGING
     fprintf(stderr, "Rank %d: entering %s\n", my_rank_g, __func__);
 #endif
-    FUNC_ENTER_VOL(herr_t, SUCCEED)
-
-    H5VL_pdc_obj_t *o         = (H5VL_pdc_obj_t *)obj;
-    void *          tag_value = NULL;
-    pdc_var_type_t  value_type;
-
-    if (o->obj_id > 0) {
-        PDCobj_get_tag(o->obj_id, (char *)o->attr_name, &tag_value, &value_type, &(o->attr_value_size));
-    }
-    else if (o->cont_id > 0) {
-        PDCcont_get_tag(o->cont_id, (char *)o->attr_name, &tag_value, &value_type, &(o->attr_value_size));
-    }
+    H5VL_pdc_obj_t *o = (H5VL_pdc_obj_t *)obj;
 
     switch (args->op_type) {
         case H5VL_ATTR_GET_SPACE:
-            hsize_t dims[1];
-            dims[0] = o->attr_value_size / PDC_get_var_type_size(value_type);
-            // TODO: handle compound
-            hid_t space_id                = H5Screate_simple(1, dims, NULL);
-            args->args.get_space.space_id = space_id;
-
-            break;
+            args->args.get_space.space_id = H5Scopy(o->attr_space);
+            return args->args.get_space.space_id < 0 ? -1 : 0;
         case H5VL_ATTR_GET_TYPE:
-            hid_t dtype;
-            switch (value_type) {
-                case PDC_INT:
-                    dtype = H5Tcopy(H5T_NATIVE_INT);
-                    break;
-                case PDC_FLOAT:
-                    dtype = H5Tcopy(H5T_NATIVE_FLOAT);
-                    break;
-                case PDC_DOUBLE:
-                    dtype = H5Tcopy(H5T_NATIVE_DOUBLE);
-                    break;
-                case PDC_CHAR:
-
-                case PDC_STRING:
-                    dtype = H5Tcopy(H5T_C_S1);
-                    H5Tset_size(dtype, o->attr_value_size);
-                    break;
-                default:
-                    fprintf(stderr, "Rank %d: %s unsupported PDC datatype type\n", my_rank_g, __func__);
-                    HGOTO_ERROR(H5E_VOL, H5E_UNSUPPORTED, FAIL,
-                                "invalid or unsupported attribute get operation");
+            args->args.get_type.type_id = H5Tcopy(o->attr_type);
+            return args->args.get_type.type_id < 0 ? -1 : 0;
+        case H5VL_ATTR_GET_ACPL:
+            args->args.get_acpl.acpl_id = H5Pcreate(H5P_ATTRIBUTE_CREATE);
+            return args->args.get_acpl.acpl_id < 0 ? -1 : 0;
+        case H5VL_ATTR_GET_NAME: {
+            size_t len;
+            if (args->args.get_name.loc_params.type != H5VL_OBJECT_BY_SELF)
+                return -1;
+            len = strlen(o->attr_name);
+            if (args->args.get_name.buf && args->args.get_name.buf_size > 0) {
+                strncpy(args->args.get_name.buf, o->attr_name, args->args.get_name.buf_size - 1);
+                args->args.get_name.buf[args->args.get_name.buf_size - 1] = '\0';
             }
-            args->args.get_type.type_id = dtype;
-
-            break;
+            *args->args.get_name.attr_name_len = len;
+            return 0;
+        }
+        case H5VL_ATTR_GET_INFO: {
+            H5A_info_t *info;
+            if (args->args.get_info.loc_params.type != H5VL_OBJECT_BY_SELF)
+                return -1;
+            info = args->args.get_info.ainfo;
+            memset(info, 0, sizeof(*info));
+            info->cset      = H5T_CSET_ASCII;
+            info->data_size = o->attr_value_size;
+            return 0;
+        }
         default:
-            fprintf(stderr, "Rank %d: %s unsupported get type\n", my_rank_g, __func__);
-            HGOTO_ERROR(H5E_VOL, H5E_UNSUPPORTED, FAIL, "invalid or unsupported attribute get operation");
+            return -1;
     }
-
-    if (tag_value)
-        free(tag_value);
-
-done:
-    /* Check for async request */
-    if (req && *req)
-        *req = H5VL_pdc_new_obj(*req, o->under_vol_id);
-
-    FUNC_LEAVE_VOL
 } /* end H5VL_pdc_attr_get() */
 
 /*---------------------------------------------------------------------------*/
 static herr_t
-H5VL_pdc_attr_specific(void *                     obj __attribute__((unused)),
-                       const H5VL_loc_params_t *  loc_params __attribute__((unused)),
-                       H5VL_attr_specific_args_t *args __attribute__((unused)),
+H5VL_pdc_attr_specific(void *obj, const H5VL_loc_params_t *loc_params, H5VL_attr_specific_args_t *args,
                        hid_t dxpl_id __attribute__((unused)), void **req __attribute__((unused)))
 {
-    return 0;
+    H5VL_pdc_obj_t *o = (H5VL_pdc_obj_t *)obj, *tmp;
+    H5VL_pdc_obj_t *owner = _loc_owner(o, loc_params, &tmp);
+    H5VL_pdc_obj_t *file  = _file_of(o);
+    void *          idx   = NULL;
+    psize_t         len;
+    herr_t          ret = -1;
+
+    if (owner == NULL)
+        return -1;
+
+    switch (args->op_type) {
+        case H5VL_ATTR_EXISTS:
+            if (_tag_get(owner, H5VL_PDC_ATTR_INDEX, &idx, &len, NULL) == 0) {
+                *args->args.exists.exists = idx && _attr_find(idx, len, args->args.exists.name, NULL, NULL);
+                ret                       = 0;
+            }
+            break;
+        case H5VL_ATTR_DELETE: {
+            herr_t status = -1;
+            _change_begin(file);
+            if (_is_writer(file))
+                status = _attr_index_remove(owner, args->args.del.name);
+            ret = _sync_status(file, status);
+            break;
+        }
+        case H5VL_ATTR_ITER: {
+            H5VL_attr_iterate_args_t *it = &args->args.iterate;
+            hid_t                     id = H5I_INVALID_HID;
+            H5VL_pdc_obj_t *          self;
+            _pdc_loc_t                loc = {0};
+            int                       count = 0, total = 0, pos = 0;
+            const unsigned char *     p, *end;
+            _attr_rec_t               rec;
+            hsize_t                   start = it->idx ? *it->idx : 0;
+
+            /* The callback takes an ID for the attribute's owner */
+            loc.type     = owner->h5i_type == H5I_DATASET ? PDC_ENTITY_OBJ : PDC_ENTITY_CONT;
+            loc.meta_id  = owner->meta_id;
+            loc.path     = owner->path;
+            loc.pdc_name = owner->pdc_name;
+            self         = _open_loc(file, &loc);
+            if (self)
+                id = H5VLwrap_register(self, owner->h5i_type == H5I_DATASET ? H5I_DATASET : H5I_GROUP);
+            if (id < 0)
+                break;
+            ret = 0;
+            if (_tag_get(owner, H5VL_PDC_ATTR_INDEX, &idx, &len, NULL) < 0)
+                ret = -1;
+            if (idx) {
+                p   = idx;
+                end = p + len;
+                while ((p = _attr_next(p, end, &rec)) != NULL)
+                    total++;
+                (void)count;
+                for (hsize_t k = start; ret == 0 && k < (hsize_t)total; k++) {
+                    hsize_t    want = it->order == H5_ITER_DEC ? (hsize_t)total - 1 - k : k;
+                    H5A_info_t ainfo;
+                    char *     name;
+                    p   = idx;
+                    pos = 0;
+                    while ((p = _attr_next(p, end, &rec)) != NULL && (hsize_t)pos != want)
+                        pos++;
+                    name = strndup(rec.name, rec.name_len);
+                    memset(&ainfo, 0, sizeof(ainfo));
+                    ainfo.cset = H5T_CSET_ASCII;
+                    ret        = it->op(id, name, &ainfo, it->op_data);
+                    free(name);
+                    if (it->idx)
+                        *it->idx = k + 1;
+                }
+            }
+            H5Idec_ref(id);
+            break;
+        }
+        default:
+            break;
+    }
+    free(idx);
+    if (tmp)
+        _close_obj(tmp);
+    return ret;
 } /* end H5VL_pdc_attr_specific() */
 
 /*---------------------------------------------------------------------------*/
@@ -2447,66 +3455,45 @@ H5VL_pdc_attr_optional(void *obj __attribute__((unused)), H5VL_optional_args_t *
 
 /*---------------------------------------------------------------------------*/
 static herr_t
-H5VL_pdc_attr_close(void *attr __attribute__((unused)), hid_t dxpl_id __attribute__((unused)),
-                    void **req __attribute__((unused)))
+H5VL_pdc_attr_close(void *attr, hid_t dxpl_id __attribute__((unused)), void **req __attribute__((unused)))
 {
 #ifdef ENABLE_LOGGING
     fprintf(stderr, "Rank %d: entering %s\n", my_rank_g, __func__);
 #endif
+    H5VL_pdc_obj_t *o    = (H5VL_pdc_obj_t *)attr;
+    H5VL_pdc_obj_t *file = o->file_obj_ptr;
 
-    /* H5VL_pdc_obj_t *o = (H5VL_pdc_obj_t *)attr; */
-    herr_t ret_value = SUCCEED;
-
-    return ret_value;
+    if (o->attr_type > 0)
+        H5Tclose(o->attr_type);
+    if (o->attr_space > 0)
+        H5Sclose(o->attr_space);
+    if (o->attr_owner_tmp)
+        _close_obj(o->attr_owner_tmp);
+    free(o->attr_name);
+    free(o);
+    return H5VL__pdc_file_close(file);
 } /* end H5VL_pdc_attr_close() */
 
 /*---------------------------------------------------------------------------*/
 static void *
-H5VL_pdc_object_open(void *obj, const H5VL_loc_params_t *loc_params, H5I_type_t *opened_type, hid_t dxpl_id,
-                     void **req)
+H5VL_pdc_object_open(void *obj, const H5VL_loc_params_t *loc_params, H5I_type_t *opened_type,
+                     hid_t dxpl_id __attribute__((unused)), void **req __attribute__((unused)))
 {
 #ifdef ENABLE_LOGGING
     fprintf(stderr, "Rank %d: entering %s\n", my_rank_g, __func__);
 #endif
+    H5VL_pdc_obj_t *o       = (H5VL_pdc_obj_t *)obj;
+    H5VL_pdc_obj_t *new_obj = NULL;
+    _pdc_loc_t      loc;
 
-    H5VL_pdc_obj_t *new_obj;
-    H5VL_pdc_obj_t *o = (H5VL_pdc_obj_t *)obj;
-    /* void *          under = NULL; */
-
-    /* Only support dataset open and group open for now. */
-    new_obj = H5VL_pdc_dataset_open(obj, loc_params, loc_params->loc_data.loc_by_name.name, 0, dxpl_id, req);
-    if (new_obj == NULL) {
-        new_obj =
-            H5VL_pdc_group_open(obj, loc_params, loc_params->loc_data.loc_by_name.name, 0, dxpl_id, req);
-        if (new_obj != NULL)
-            *opened_type = H5I_GROUP;
-    }
-    else {
-        *opened_type = H5I_DATASET;
-    }
-
-    if (req && *req)
-        *req = H5VL_pdc_new_obj(*req, o->under_vol_id);
-
-    return (void *)new_obj;
-
-    if (o->h5i_type == H5I_DATASET) {
-        new_obj =
-            H5VL_pdc_dataset_open(obj, loc_params, loc_params->loc_data.loc_by_name.name, 0, dxpl_id, req);
-    }
-    else if (loc_params->obj_type == H5I_GROUP) {
-        new_obj =
-            H5VL_pdc_group_open(obj, loc_params, loc_params->loc_data.loc_by_name.name, 0, dxpl_id, req);
-    }
-    else if (loc_params->obj_type == H5I_FILE) {
-        new_obj = H5VL_pdc_attr_open(obj, loc_params, loc_params->loc_data.loc_by_name.name, 0, dxpl_id, req);
-    }
-    else {
-        new_obj = NULL;
-    }
-    if (req && *req)
-        *req = H5VL_pdc_new_obj(*req, o->under_vol_id);
-
+    if (loc_params->type != H5VL_OBJECT_BY_NAME)
+        return NULL;
+    if (_resolve(o, loc_params->loc_data.loc_by_name.name, &loc) != 0)
+        return NULL;
+    new_obj = _open_loc(_file_of(o), &loc);
+    if (new_obj)
+        *opened_type = loc.type == PDC_ENTITY_CONT ? H5I_GROUP : H5I_DATASET;
+    _loc_free(&loc);
     return (void *)new_obj;
 } /* end H5VL_pdc_object_open() */
 
@@ -2525,72 +3512,92 @@ H5VL_pdc_object_copy(void *                   src_obj __attribute__((unused)),
 
 /*---------------------------------------------------------------------------*/
 static herr_t
-H5VL_pdc_object_get(void *obj, const H5VL_loc_params_t *loc_params __attribute__((unused)),
-                    H5VL_object_get_args_t *args, hid_t dxpl_id __attribute__((unused)), void **req)
+H5VL_pdc_object_get(void *obj, const H5VL_loc_params_t *loc_params, H5VL_object_get_args_t *args,
+                    hid_t dxpl_id __attribute__((unused)), void **req __attribute__((unused)))
 {
 #ifdef ENABLE_LOGGING
     fprintf(stderr, "Rank %d: entering %s\n", my_rank_g, __func__);
 #endif
+    H5VL_pdc_obj_t *o = (H5VL_pdc_obj_t *)obj, *tmp = NULL, *target;
+    herr_t          ret = -1;
 
-    FUNC_ENTER_VOL(herr_t, SUCCEED)
-
-    H5VL_pdc_obj_t *o = (H5VL_pdc_obj_t *)obj;
+    if (args->op_type == H5VL_OBJECT_GET_FILE) {
+        *(args->args.get_file.file) = o->file_obj_ptr;
+        return 0;
+    }
+    if (o->h5i_type == H5I_ATTR)
+        return -1;
+    target = _loc_owner(o, loc_params, &tmp);
+    if (target == NULL)
+        return -1;
 
     switch (args->op_type) {
-        case H5VL_OBJECT_GET_FILE:
-            *(args->args.get_file.file) = o->file_obj_ptr;
+        case H5VL_OBJECT_GET_NAME: {
+            const char *path = target->path ? target->path : "/";
+            size_t      len  = strlen(path);
+            if (args->args.get_name.buf && args->args.get_name.buf_size > 0) {
+                strncpy(args->args.get_name.buf, path, args->args.get_name.buf_size - 1);
+                args->args.get_name.buf[args->args.get_name.buf_size - 1] = '\0';
+            }
+            *args->args.get_name.name_len = len;
+            ret                           = 0;
             break;
-
-        case H5VL_OBJECT_GET_NAME:
-            HGOTO_ERROR(H5E_VOL, H5E_UNSUPPORTED, FAIL, "unsupported object get operation");
-            break;
-
+        }
         case H5VL_OBJECT_GET_TYPE:
-            *(args->args.get_type.obj_type) = o->h5o_type;
+            *(args->args.get_type.obj_type) =
+                target->h5i_type == H5I_DATASET ? H5O_TYPE_DATASET : H5O_TYPE_GROUP;
+            ret = 0;
             break;
-
-            /* case H5VL_OBJECT_GET_INFO: */
-            /*     H5O_info2_t     *oinfo        = args->args.get_info.oinfo; */
-            /*     unsigned         fields       = args->args.get_info.fields; */
-            /*     break; */
-
+        case H5VL_OBJECT_GET_INFO: {
+            hsize_t num_attrs = args->args.get_info.fields & H5O_INFO_NUM_ATTRS ? _attr_count(target) : 0;
+            _fill_oinfo(_file_of(target), target->meta_id,
+                        target->h5i_type == H5I_DATASET ? H5O_TYPE_DATASET : H5O_TYPE_GROUP, num_attrs,
+                        args->args.get_info.oinfo);
+            ret = 0;
+            break;
+        }
         default:
-            fprintf(stderr, "Rank %d: %s unsupported get type\n", my_rank_g, __func__);
-            HGOTO_ERROR(H5E_VOL, H5E_UNSUPPORTED, FAIL, "invalid or unsupported object get operation");
-    } /* end switch */
-
-done:
-    /* Check for async request */
-    if (req && *req)
-        *req = H5VL_pdc_new_obj(*req, o->under_vol_id);
-
-    FUNC_LEAVE_VOL
+            break;
+    }
+    if (tmp)
+        _close_obj(tmp);
+    return ret;
 } /* end H5VL_pdc_object_get() */
 
 /*---------------------------------------------------------------------------*/
 static herr_t
 H5VL_pdc_object_specific(void *obj, const H5VL_loc_params_t *loc_params, H5VL_object_specific_args_t *args,
-                         hid_t dxpl_id, void **req)
+                         hid_t dxpl_id __attribute__((unused)), void **req __attribute__((unused)))
 {
 #ifdef ENABLE_LOGGING
     fprintf(stderr, "Rank %d: entering %s\n", my_rank_g, __func__);
 #endif
-
     H5VL_pdc_obj_t *o = (H5VL_pdc_obj_t *)obj;
-    hid_t           under_vol_id;
-    herr_t          ret_value;
 
-    // Save copy of underlying VOL connector ID and prov helper, in case of
-    // refresh destroying the current object
-    under_vol_id = o->under_vol_id;
-
-    ret_value = H5VLobject_specific(o->under_object, loc_params, o->under_vol_id, args, dxpl_id, req);
-
-    /* Check for async request */
-    if (req && *req)
-        *req = H5VL_pdc_new_obj(*req, under_vol_id);
-
-    return ret_value;
+    switch (args->op_type) {
+        case H5VL_OBJECT_EXISTS: {
+            _pdc_loc_t loc;
+            int        found;
+            if (loc_params->type != H5VL_OBJECT_BY_NAME)
+                return -1;
+            found = _resolve(o, loc_params->loc_data.loc_by_name.name, &loc);
+            if (found < 0)
+                return -1;
+            if (found == 0)
+                _loc_free(&loc);
+            *args->args.exists.exists = found == 0;
+            return 0;
+        }
+        case H5VL_OBJECT_FLUSH:
+            return _flush_xfer_requests(_file_of(o)) == SUCCEED ? 0 : -1;
+        case H5VL_OBJECT_REFRESH:
+            return 0;
+        case H5VL_OBJECT_CHANGE_REF_COUNT:
+        case H5VL_OBJECT_LOOKUP:
+        case H5VL_OBJECT_VISIT:
+        default:
+            return -1;
+    }
 } /* end H5VL_pdc_object_specific() */
 
 static herr_t
@@ -2685,9 +3692,10 @@ H5VL_pdc_blob_optional(void *obj __attribute__((unused)), void *blob_id __attrib
 
 /*---------------------------------------------------------------------------*/
 static herr_t
-H5VL_pdc_token_cmp(void *obj __attribute__((unused)), const H5O_token_t *token1 __attribute__((unused)),
-                   const H5O_token_t *token2 __attribute__((unused)), int *cmp_value __attribute__((unused)))
+H5VL_pdc_token_cmp(void *obj __attribute__((unused)), const H5O_token_t *token1, const H5O_token_t *token2,
+                   int *cmp_value)
 {
+    *cmp_value = memcmp(token1, token2, sizeof(H5O_token_t));
     return 0;
 } /* end H5VL_pdc_token_cmp() */
 
