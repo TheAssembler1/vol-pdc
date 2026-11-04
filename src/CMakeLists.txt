@@ -152,6 +152,24 @@ set(HDF5_VOL_PDC_HEADERS
 )
 
 #-----------------------------------------------------------------------------
+# Optional LD_PRELOAD helper: initializes the connector during MPI_Init. It links
+# only HDF5 and MPI, so that it can load before the connector's dependencies.
+#-----------------------------------------------------------------------------
+if(HDF5_VOL_PDC_ENABLE_MPI)
+  add_library(hdf5_vol_pdc_preinit SHARED ${CMAKE_CURRENT_SOURCE_DIR}/H5VLpdc_preinit.c)
+  target_include_directories(hdf5_vol_pdc_preinit
+    SYSTEM PRIVATE ${HDF5_INCLUDE_DIRS} ${HDF5_INCLUDE_DIR} ${MPI_INCLUDE_PATH}
+  )
+  target_link_libraries(hdf5_vol_pdc_preinit
+    ${HDF5_C_SHARED_LIBRARY} ${HDF5_LIBRARIES} ${MPI_LIBRARIES}
+  )
+  install(
+    TARGETS hdf5_vol_pdc_preinit
+    LIBRARY DESTINATION ${HDF5_VOL_PDC_INSTALL_LIB_DIR}
+  )
+endif()
+
+#-----------------------------------------------------------------------------
 # Add file(s) to CMake Install
 #-----------------------------------------------------------------------------
 install(

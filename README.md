@@ -46,6 +46,12 @@ export LD_LIBRARY_PATH="$LIBFABRIC_DIR/lib:$MERCURY_DIR/lib:$PDC_DIR/lib:$VOL_DI
 export LD_PRELOAD=$VOL_DIR/install/lib/libhdf5_vol_pdc.so
 ```
 
+The connector calls `PDCinit`, which is collective over `MPI_COMM_WORLD`, at the first HDF5 call. If ranks do not make their first HDF5 call together (for example, only rank 0 creates a file), the application hangs. To avoid this, either call `H5open()` on every rank right after `MPI_Init`, or preload the helper that does it for you:
+
+```
+export LD_PRELOAD=$VOL_DIR/lib/libhdf5_vol_pdc_preinit.so
+```
+
 PDC servers must be launched before the application, more details can be found in the [PDC documentation website](https://pdc.readthedocs.io/en/latest/getting_started.html#running-pdc).
 
 
